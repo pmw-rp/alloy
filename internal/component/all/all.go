@@ -30,6 +30,7 @@ import (
 	_ "github.com/grafana/alloy/internal/component/discovery/ovhcloud"                       // Import discovery.ovhcloud
 	_ "github.com/grafana/alloy/internal/component/discovery/process"                        // Import discovery.process
 	_ "github.com/grafana/alloy/internal/component/discovery/puppetdb"                       // Import discovery.puppetdb
+	_ "github.com/grafana/alloy/internal/component/discovery/redpanda"                       // Import discovery.redpanda
 	_ "github.com/grafana/alloy/internal/component/discovery/relabel"                        // Import discovery.relabel
 	_ "github.com/grafana/alloy/internal/component/discovery/scaleway"                       // Import discovery.scaleway
 	_ "github.com/grafana/alloy/internal/component/discovery/serverset"                      // Import discovery.serverset
