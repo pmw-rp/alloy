@@ -9,6 +9,7 @@ This repo is a fork of [grafana/alloy](https://github.com/grafana/alloy) maintai
 | Component | Path | Notes |
 |---|---|---|
 | `otelcol.exporter.kafka_router` | `internal/component/otelcol/exporter/kafka_router/` | Routes OTLP metrics/logs to Kafka topics via an ordered, templated route list with per-route fallback topics. Stability: `experimental`. |
+| `discovery.redpanda` | `internal/component/discovery/redpanda/` | Enriches discovered pod targets with per-pod Redpanda cluster UUIDs and a stable pod ordinal, for multi-cluster sharding without gossip. Stability: `generally-available`. |
 
 Update this table whenever a component is added, renamed, or removed — it's the source of truth for what this fork carries beyond upstream.
 
