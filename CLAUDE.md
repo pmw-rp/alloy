@@ -80,9 +80,32 @@ git fetch upstream --tags
 4. If any `require` line in `go.mod` changed, also run `make generate-otel-collector-distro` and confirm there's no further diff — CI's `check` job enforces this (see root `AGENTS.md`).
 5. Rebuild and re-verify every custom component registers, as in step 4 of "Adding or changing a custom component."
 6. Run `make lint` and the test suite before pushing.
-7. Push `main` to `origin`. Optionally tag the result (e.g. `redpanda-v1.18.0-1`) to mark "upstream v1.18.0 + our components" for future bisecting.
+7. Push `main` to `origin`, and tag the result per the "Tagging convention" below (e.g. `v1.18.0-rp`) for future bisecting and image builds.
 
 Tip: `git config rerere.enabled true` — the same conflict shape (the `all.go` import block) recurs every upgrade; rerere remembers and reapplies prior resolutions automatically, so repeat conflicts get cheaper over time.
+
+## Tagging convention
+
+Tag the commit on `main` you're about to build/publish as `<upstream-release>-rp` (e.g. `v1.17.1-rp` for the commit that's `v1.17.1` plus our components). Push the tag: `git push origin <tag>`. This is the same string used as `VERSION` when building the image (see below), so `alloy --version` on a running container tells you exactly which upstream release plus which of our commits it was built from.
+
+`main`'s base was originally cut from an arbitrary point on upstream's `main` branch (a pre-release dev snapshot), not a tagged release. It was later realigned with `git rebase --rebase-merges --onto v1.17.1 <old-base>` so the tag above would mean something concrete. That realignment was a one-time correction — see "Why merge, not rebase" below for why it isn't the normal upgrade path.
+
+## Building and publishing an image
+
+The Docker image build is fully self-contained — the `Dockerfile` builds the UI, compiles the binary, and assembles the runtime image in one multi-stage `docker build`. No local `go build` is needed first.
+
+```sh
+make alloy-image VERSION=v1.17.1-rp ALLOY_IMAGE=<registry>/<image>:<tag>
+```
+
+- `VERSION` is baked into the binary (`alloy --version`) and should match the tag from "Tagging convention" above. If `HEAD` has an exact-match `v*` git tag, `scripts/image-tag` infers `VERSION` automatically — passing it explicitly is just for clarity.
+- `ALLOY_IMAGE` only controls the local image tag `docker build` produces; there's no `make push` target. Push manually once the build finishes:
+  ```sh
+  docker push <registry>/<image>:<tag>
+  ```
+- An already-built image can be retagged for a different registry without rebuilding: `docker tag <local-tag> <new-registry>/<image>:<tag>`.
+- Requires `docker login` to whichever registry you're pushing to first.
+- Registry: currently Docker Hub, under `paulmw/alloy`. This is expected to change — update this line when it does.
 
 ## Why merge, not rebase
 
