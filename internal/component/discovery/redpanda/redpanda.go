@@ -112,7 +112,16 @@ type Component struct {
 
 var _ component.Component = (*Component)(nil)
 
-// New creates a new discovery.redpanda component.
+// New creates a new discovery.redpanda component. It deliberately does not
+// wait to find itself among cluster.Peers(), let alone build the Raft node,
+// synchronously here: the cluster service only registers this node as a
+// peer once its own Run() has started the underlying gossip node
+// (internal/service/cluster/cluster.go's node.Start()), which is a separate
+// lifecycle phase from component construction with no ordering guarantee
+// relative to it. Failing New() on that race would crash-loop the
+// component on totally ordinary startup timing, not just genuine
+// misconfiguration. That work happens in Run() instead, which can afford to
+// wait.
 func New(opts component.Options, args Arguments) (*Component, error) {
 	data, err := opts.GetServiceData(cluster.ServiceName)
 	if err != nil {
@@ -120,41 +129,14 @@ func New(opts component.Options, args Arguments) (*Component, error) {
 	}
 	clusterSvc := data.(cluster.Cluster)
 
-	selfName, selfHost, err := selfIdentity(clusterSvc)
-	if err != nil {
-		return nil, err
-	}
-
-	if peers := clusterSvc.Peers(); len(peers) == 1 {
-		opts.Logger.Warn(
-			"this replica sees no other cluster peers; if this is meant to be a multi-replica deployment, " +
-				"broker-to-collector allocation will not be sharded correctly. Check that Alloy was started " +
-				"with --cluster.enabled and the other replicas are reachable. If you intend to run a single " +
-				"replica, this warning is expected and can be ignored. Consider setting --cluster.wait-for-size " +
-				"to the intended replica count so the cluster service refuses to serve traffic until every " +
-				"replica has actually joined, instead of each isolated replica silently assuming it owns everything.",
-		)
-	}
-
 	raftBindPort := args.RaftBindPort
 	if raftBindPort == 0 {
 		raftBindPort = defaultRaftBindPort
 	}
 
-	node, err := newRaftNode(
-		filepath.Join(opts.DataPath, "raft"),
-		selfName, selfHost, raftBindPort,
-		clusterSvc.Peers(),
-		slogWriter{opts.Logger},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("starting raft node: %w", err)
-	}
-
 	c := &Component{
 		opts:         opts,
 		cluster:      clusterSvc,
-		node:         node,
 		raftBindPort: raftBindPort,
 		uuidCache:    make(map[string]string),
 		tracked:      make(map[string]trackedPod),
@@ -166,7 +148,9 @@ func New(opts component.Options, args Arguments) (*Component, error) {
 }
 
 // selfIdentity finds this node's own name and host among the current
-// cluster peers.
+// cluster peers. It returns an error if self isn't present yet — a normal,
+// expected condition early in startup (see New()'s doc comment), not
+// necessarily a misconfiguration.
 func selfIdentity(cl cluster.Cluster) (name, host string, err error) {
 	for _, p := range cl.Peers() {
 		if p.Self {
@@ -180,19 +164,38 @@ func selfIdentity(cl cluster.Cluster) (name, host string, err error) {
 	return "", "", fmt.Errorf("could not find self in cluster peers")
 }
 
-// Run implements component.Component. It owns the Raft node's reconcile
-// loop: only the current leader acts, bridging cluster.Peers() into Raft
-// voter membership and proposing broker assignment changes.
+// Run implements component.Component. It first waits for this replica to
+// appear in cluster.Peers() (see New()'s doc comment for why that can't
+// happen synchronously in New()), builds the Raft node once that's
+// possible, and then owns the Raft node's reconcile loop: only the current
+// leader acts, bridging cluster.Peers() into Raft voter membership and
+// proposing broker assignment changes.
 func (c *Component) Run(ctx context.Context) error {
+	node, err := c.waitAndBuildRaftNode(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		return err
+	}
+
+	c.mut.Lock()
+	c.node = node
+	c.mut.Unlock()
+
+	// Targets may already be waiting (Update() may have run before the node
+	// existed) — publish now that ownership can actually be determined.
+	c.publishTargets()
+
 	ticker := time.NewTicker(reconcileInterval)
 	defer ticker.Stop()
 
-	leaderCh := c.node.raft.LeaderCh()
+	leaderCh := node.raft.LeaderCh()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return c.node.raft.Shutdown().Error()
+			return node.raft.Shutdown().Error()
 		case <-leaderCh:
 			c.reconcile()
 		case <-ticker.C:
@@ -201,28 +204,77 @@ func (c *Component) Run(ctx context.Context) error {
 	}
 }
 
+// waitAndBuildRaftNode polls cluster.Peers() until this replica appears
+// (logging progress, not failing) and then constructs the Raft node.
+func (c *Component) waitAndBuildRaftNode(ctx context.Context) (*raftNode, error) {
+	const pollInterval = time.Second
+
+	var (
+		selfName, selfHost string
+		err                error
+	)
+	for {
+		selfName, selfHost, err = selfIdentity(c.cluster)
+		if err == nil {
+			break
+		}
+		c.opts.Logger.Debug("waiting to find self in cluster peers before starting raft", "err", err)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(pollInterval):
+		}
+	}
+
+	if peers := c.cluster.Peers(); len(peers) == 1 {
+		c.opts.Logger.Warn(
+			"this replica sees no other cluster peers; if this is meant to be a multi-replica deployment, " +
+				"broker-to-collector allocation will not be sharded correctly. Check that Alloy was started " +
+				"with --cluster.enabled and the other replicas are reachable. If you intend to run a single " +
+				"replica, this warning is expected and can be ignored. Consider setting --cluster.wait-for-size " +
+				"to the intended replica count so the cluster service refuses to serve traffic until every " +
+				"replica has actually joined, instead of each isolated replica silently assuming it owns everything.",
+		)
+	}
+
+	node, err := newRaftNode(
+		filepath.Join(c.opts.DataPath, "raft"),
+		selfName, selfHost, c.raftBindPort,
+		c.cluster.Peers(),
+		slogWriter{c.opts.Logger},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("starting raft node: %w", err)
+	}
+	return node, nil
+}
+
 // reconcile is the leader-only work: bridge gossip membership into Raft
 // voters, then reconcile broker assignments against the current tracked set.
-// A no-op on followers (isLeader() guards every write inside).
+// A no-op on followers (isLeader() guards every write inside) or if the
+// Raft node hasn't been built yet.
 func (c *Component) reconcile() {
-	if !c.node.isLeader() {
+	c.mut.Lock()
+	node := c.node
+	c.mut.Unlock()
+	if node == nil || !node.isLeader() {
 		return
 	}
 
-	prevVoters, err := c.node.currentVoters()
+	prevVoters, err := node.currentVoters()
 	if err != nil {
 		c.opts.Logger.Warn("failed to read raft configuration", "err", err)
 		return
 	}
 
 	peers := c.cluster.Peers()
-	if err := c.node.reconcileMembership(peers, func(p peer.Peer) raft.ServerAddress {
+	if err := node.reconcileMembership(peers, func(p peer.Peer) raft.ServerAddress {
 		return raftAddrFor(p, c.raftBindPort)
 	}); err != nil {
 		c.opts.Logger.Warn("failed to reconcile raft membership", "err", err)
 	}
 
-	newVoters, err := c.node.currentVoters()
+	newVoters, err := node.currentVoters()
 	if err != nil {
 		c.opts.Logger.Warn("failed to read raft configuration", "err", err)
 		return
@@ -240,10 +292,10 @@ func (c *Component) reconcile() {
 	}
 	c.mut.Unlock()
 
-	current := c.node.fsm.snapshotState()
+	current := node.fsm.snapshotState()
 	cmds := reconcileAssignments(current, tracked, newVoters, addedCollectors)
 	for _, cmd := range cmds {
-		if err := c.node.propose(cmd); err != nil {
+		if err := node.propose(cmd); err != nil {
 			c.opts.Logger.Warn("failed to propose broker assignment", "err", err, "broker", cmd.BrokerID)
 		}
 	}
@@ -352,19 +404,31 @@ func (c *Component) publishTargets() {
 	// every replica believe it's the only one and scrape every broker N
 	// times over, since a lone, ungossiped node is indistinguishable from a
 	// genuinely single-replica deployment from inside this component.
-	if !c.cluster.Ready() {
-		c.opts.Logger.Debug("cluster not ready, publishing no targets")
-		c.opts.OnStateChange(Exports{Targets: nil})
-		return
-	}
-
 	c.mut.Lock()
+	node := c.node
 	rawTargets := c.lastTargets
 	uuidCache := make(map[string]string, len(c.uuidCache))
 	for k, v := range c.uuidCache {
 		uuidCache[k] = v
 	}
 	c.mut.Unlock()
+
+	// node is nil until Run() finds this replica in cluster.Peers() and
+	// builds the Raft node (see New()'s doc comment for why that can't
+	// happen synchronously). Until then, and whenever the cluster isn't
+	// Ready() (e.g. --cluster.wait-for-size not yet met), this replica must
+	// not assume it's safe to scrape anything — the same rule
+	// discovery.DistributedTargets and other clustering-aware components
+	// follow. Without this, a deployment that forgot --cluster.enabled
+	// entirely would have every replica believe it's the only one and
+	// scrape every broker N times over, since a lone, ungossiped node is
+	// indistinguishable from a genuinely single-replica deployment from
+	// inside this component.
+	if node == nil || !c.cluster.Ready() {
+		c.opts.Logger.Debug("cluster not ready, publishing no targets")
+		c.opts.OnStateChange(Exports{Targets: nil})
+		return
+	}
 
 	enriched := make([]discovery.Target, 0, len(rawTargets))
 	for _, t := range rawTargets {
@@ -378,8 +442,8 @@ func (c *Component) publishTargets() {
 			c.opts.Logger.Warn("excluding target with unknown cluster UUID", "key", key)
 			continue
 		}
-		collector, has := c.node.fsm.collectorOf(key)
-		if !has || collector != c.node.self {
+		collector, has := node.fsm.collectorOf(key)
+		if !has || collector != node.self {
 			continue // not assigned to this replica
 		}
 		builder := discovery.NewTargetBuilderFrom(t)
