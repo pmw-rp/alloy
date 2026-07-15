@@ -125,6 +125,17 @@ func New(opts component.Options, args Arguments) (*Component, error) {
 		return nil, err
 	}
 
+	if peers := clusterSvc.Peers(); len(peers) == 1 {
+		opts.Logger.Warn(
+			"this replica sees no other cluster peers; if this is meant to be a multi-replica deployment, " +
+				"broker-to-collector allocation will not be sharded correctly. Check that Alloy was started " +
+				"with --cluster.enabled and the other replicas are reachable. If you intend to run a single " +
+				"replica, this warning is expected and can be ignored. Consider setting --cluster.wait-for-size " +
+				"to the intended replica count so the cluster service refuses to serve traffic until every " +
+				"replica has actually joined, instead of each isolated replica silently assuming it owns everything.",
+		)
+	}
+
 	raftBindPort := args.RaftBindPort
 	if raftBindPort == 0 {
 		raftBindPort = defaultRaftBindPort
@@ -333,6 +344,20 @@ func (c *Component) Update(args component.Arguments) error {
 // Update (after a discovery refresh) and from reconcile (after an
 // assignment change that happened independently of any discovery refresh).
 func (c *Component) publishTargets() {
+	// If the operator configured --cluster.wait-for-size and the cluster
+	// hasn't reached it yet, this replica must not assume it's safe to
+	// scrape anything — the same rule discovery.DistributedTargets and
+	// other clustering-aware components follow. Without this check, a
+	// deployment that forgot --cluster.enabled entirely would silently have
+	// every replica believe it's the only one and scrape every broker N
+	// times over, since a lone, ungossiped node is indistinguishable from a
+	// genuinely single-replica deployment from inside this component.
+	if !c.cluster.Ready() {
+		c.opts.Logger.Debug("cluster not ready, publishing no targets")
+		c.opts.OnStateChange(Exports{Targets: nil})
+		return
+	}
+
 	c.mut.Lock()
 	rawTargets := c.lastTargets
 	uuidCache := make(map[string]string, len(c.uuidCache))
