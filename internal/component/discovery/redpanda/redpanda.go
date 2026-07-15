@@ -8,12 +8,24 @@
 // Update blocks until all uncached pods are fetched, so published targets
 // always carry the cluster_uuid label.
 //
-// Each target also receives a __tmp_pod_ordinal label: a stable integer (0..N-1)
-// assigned by sorting all known pods by (namespace, statefulset-name, pod-ordinal).
-// Collector pods use this label with env("POD_INDEX") to shard scrape targets
-// without relying on gossip-based clustering. Pods that temporarily disappear
-// (e.g. during rolling restarts) hold their ordinal slot for StaleTimeout
-// (default 5m) to prevent renumbering.
+// Which collector replica scrapes which broker is decided by an embedded
+// Raft group spanning every replica of this component (one Raft peer per
+// Alloy collector replica, membership driven by Alloy's native gossip
+// clustering via cluster.Peers() — see raftnode.go). Only the current Raft
+// leader proposes assignment changes (see allocate.go); every replica reads
+// the resulting committed state to decide which brokers it owns. This
+// replaced an earlier static ordinal/NumShards scheme: that scheme required
+// NumShards to be kept manually in sync with the real collector replica
+// count, and its global sort coupled every Redpanda cluster's assignment to
+// every other cluster's topology. There is no toggle back to that scheme —
+// Raft-backed allocation is unconditional, including for single-replica
+// deployments (which simply run a degenerate single-voter Raft group).
+//
+// Upgrading an existing deployment from the old scheme requires a
+// coordinated, all-at-once rollout of every collector replica: there is no
+// safety net that mirrors the old assignment until every replica has
+// migrated, so a rolling restart can briefly double-scrape or gap brokers
+// while old- and new-code replicas coexist.
 package redpanda
 
 import (
@@ -22,16 +34,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"sort"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/grafana/ckit/peer"
+	"github.com/hashicorp/raft"
+
 	"github.com/grafana/alloy/internal/component"
 	"github.com/grafana/alloy/internal/component/discovery"
 	"github.com/grafana/alloy/internal/featuregate"
+	"github.com/grafana/alloy/internal/service/cluster"
 )
 
 func init() {
@@ -48,24 +64,25 @@ func init() {
 
 const (
 	defaultAdminPort    = 9644
+	defaultRaftBindPort = 9700
 	fetchTimeout        = 10 * time.Second
 	defaultStaleTimeout = 5 * time.Minute
-	labelPodOrdinal     = "__tmp_pod_ordinal"
+	reconcileInterval   = 10 * time.Second
 )
 
-// Arguments configures the discovery.redpanda_uuid component.
+// Arguments configures the discovery.redpanda component.
 type Arguments struct {
 	Targets       []discovery.Target `alloy:"targets,attr"`
 	AdminPort     int                `alloy:"admin_port,attr,optional"`
 	TLSEnabled    bool               `alloy:"tls_enabled,attr,optional"`
 	TLSSkipVerify bool               `alloy:"tls_skip_verify,attr,optional"`
 	// StaleTimeout is how long a pod that disappears from discovery holds its
-	// ordinal slot before being evicted and triggering renumbering. Default: 5m.
+	// assignment before being evicted. Default: 5m.
 	StaleTimeout time.Duration `alloy:"stale_timeout,attr,optional"`
-	// NumShards is the number of collector pods (replicas). When set, the label
-	// value is ordinal % NumShards rather than the raw ordinal, so collectors
-	// and Redpanda pods don't need to be 1:1. Default: 0 (use raw ordinal).
-	NumShards int `alloy:"num_shards,attr,optional"`
+	// RaftBindPort is the TCP port this component binds for Raft RPC between
+	// collector replicas. Must be the same across every replica in the
+	// fleet, and separate from Alloy's own clustering port. Default: 9700.
+	RaftBindPort int `alloy:"raft_bind_port,attr,optional"`
 }
 
 // Exports holds the enriched targets output.
@@ -73,30 +90,63 @@ type Exports struct {
 	Targets []discovery.Target `alloy:"targets,attr"`
 }
 
-// trackedPod holds the sort metadata and last-seen timestamp for a pod.
+// trackedPod holds the last-seen timestamp for a pod. Its identity (the map
+// key) is namespace/podName; that's all the allocator needs beyond the
+// resolved cluster UUID, which lives in uuidCache.
 type trackedPod struct {
-	namespace  string
-	stsName    string
-	podOrdinal int
-	lastSeen   time.Time
+	lastSeen time.Time
 }
 
-// Component implements the discovery.redpanda_uuid component.
+// Component implements the discovery.redpanda component.
 type Component struct {
-	opts      component.Options
-	mut       sync.Mutex
-	uuidCache map[string]string     // key: "namespace/podName" → cluster_uuid
-	tracked   map[string]trackedPod // key → tracking info (survives pod disappearance)
+	opts         component.Options
+	cluster      cluster.Cluster
+	node         *raftNode
+	raftBindPort int
+
+	mut         sync.Mutex
+	uuidCache   map[string]string     // key: "namespace/podName" -> cluster_uuid
+	tracked     map[string]trackedPod // key -> tracking info (survives pod disappearance)
+	lastTargets []discovery.Target    // raw targets from the most recent Update
 }
 
 var _ component.Component = (*Component)(nil)
 
-// New creates a new discovery.redpanda_uuid component.
+// New creates a new discovery.redpanda component.
 func New(opts component.Options, args Arguments) (*Component, error) {
+	data, err := opts.GetServiceData(cluster.ServiceName)
+	if err != nil {
+		return nil, fmt.Errorf("getting cluster service: %w", err)
+	}
+	clusterSvc := data.(cluster.Cluster)
+
+	selfName, selfHost, err := selfIdentity(clusterSvc)
+	if err != nil {
+		return nil, err
+	}
+
+	raftBindPort := args.RaftBindPort
+	if raftBindPort == 0 {
+		raftBindPort = defaultRaftBindPort
+	}
+
+	node, err := newRaftNode(
+		filepath.Join(opts.DataPath, "raft"),
+		selfName, selfHost, raftBindPort,
+		clusterSvc.Peers(),
+		slogWriter{opts.Logger},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("starting raft node: %w", err)
+	}
+
 	c := &Component{
-		opts:      opts,
-		uuidCache: make(map[string]string),
-		tracked:   make(map[string]trackedPod),
+		opts:         opts,
+		cluster:      clusterSvc,
+		node:         node,
+		raftBindPort: raftBindPort,
+		uuidCache:    make(map[string]string),
+		tracked:      make(map[string]trackedPod),
 	}
 	if err := c.Update(args); err != nil {
 		return nil, err
@@ -104,14 +154,96 @@ func New(opts component.Options, args Arguments) (*Component, error) {
 	return c, nil
 }
 
-// Run implements component.Component. All work happens in Update.
-func (c *Component) Run(ctx context.Context) error {
-	<-ctx.Done()
-	return nil
+// selfIdentity finds this node's own name and host among the current
+// cluster peers.
+func selfIdentity(cl cluster.Cluster) (name, host string, err error) {
+	for _, p := range cl.Peers() {
+		if p.Self {
+			h, _, splitErr := net.SplitHostPort(p.Addr)
+			if splitErr != nil {
+				h = p.Addr
+			}
+			return p.Name, h, nil
+		}
+	}
+	return "", "", fmt.Errorf("could not find self in cluster peers")
 }
 
-// Update fetches UUIDs for uncached pods, assigns stable ordinals sorted by
-// (namespace, statefulset-name, pod-ordinal), and publishes enriched targets.
+// Run implements component.Component. It owns the Raft node's reconcile
+// loop: only the current leader acts, bridging cluster.Peers() into Raft
+// voter membership and proposing broker assignment changes.
+func (c *Component) Run(ctx context.Context) error {
+	ticker := time.NewTicker(reconcileInterval)
+	defer ticker.Stop()
+
+	leaderCh := c.node.raft.LeaderCh()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return c.node.raft.Shutdown().Error()
+		case <-leaderCh:
+			c.reconcile()
+		case <-ticker.C:
+			c.reconcile()
+		}
+	}
+}
+
+// reconcile is the leader-only work: bridge gossip membership into Raft
+// voters, then reconcile broker assignments against the current tracked set.
+// A no-op on followers (isLeader() guards every write inside).
+func (c *Component) reconcile() {
+	if !c.node.isLeader() {
+		return
+	}
+
+	prevVoters, err := c.node.currentVoters()
+	if err != nil {
+		c.opts.Logger.Warn("failed to read raft configuration", "err", err)
+		return
+	}
+
+	peers := c.cluster.Peers()
+	if err := c.node.reconcileMembership(peers, func(p peer.Peer) raft.ServerAddress {
+		return raftAddrFor(p, c.raftBindPort)
+	}); err != nil {
+		c.opts.Logger.Warn("failed to reconcile raft membership", "err", err)
+	}
+
+	newVoters, err := c.node.currentVoters()
+	if err != nil {
+		c.opts.Logger.Warn("failed to read raft configuration", "err", err)
+		return
+	}
+	addedCollectors := diffAdded(prevVoters, newVoters)
+
+	c.mut.Lock()
+	tracked := make(map[string]brokerInfo)
+	for key := range c.tracked {
+		uuid, ok := c.uuidCache[key]
+		if !ok {
+			continue
+		}
+		tracked[key] = brokerInfo{id: key, clusterID: uuid}
+	}
+	c.mut.Unlock()
+
+	current := c.node.fsm.snapshotState()
+	cmds := reconcileAssignments(current, tracked, newVoters, addedCollectors)
+	for _, cmd := range cmds {
+		if err := c.node.propose(cmd); err != nil {
+			c.opts.Logger.Warn("failed to propose broker assignment", "err", err, "broker", cmd.BrokerID)
+		}
+	}
+
+	if len(cmds) > 0 {
+		c.publishTargets()
+	}
+}
+
+// Update fetches UUIDs for uncached pods, refreshes pod tracking, and
+// publishes the targets this replica currently owns.
 func (c *Component) Update(args component.Arguments) error {
 	newArgs := args.(Arguments)
 	if newArgs.AdminPort == 0 {
@@ -124,7 +256,6 @@ func (c *Component) Update(args component.Arguments) error {
 
 	now := time.Now()
 
-	// Index current targets by key.
 	currentTargets := make(map[string]discovery.Target, len(newArgs.Targets))
 	for _, t := range newArgs.Targets {
 		key := targetKey(t)
@@ -134,18 +265,14 @@ func (c *Component) Update(args component.Arguments) error {
 	}
 
 	c.mut.Lock()
-
-	// Mark currently-present pods as seen; register new pods with their sort metadata.
-	for key, t := range currentTargets {
+	for key := range currentTargets {
 		pod, exists := c.tracked[key]
 		if !exists {
-			pod = newTrackedPod(t)
+			pod = trackedPod{}
 		}
 		pod.lastSeen = now
 		c.tracked[key] = pod
 	}
-
-	// Evict pods absent longer than staleTimeout.
 	for key, pod := range c.tracked {
 		if now.Sub(pod.lastSeen) > staleTimeout {
 			delete(c.tracked, key)
@@ -153,36 +280,7 @@ func (c *Component) Update(args component.Arguments) error {
 			c.opts.Logger.Debug("evicted stale pod", "key", key)
 		}
 	}
-
-	// Sort all tracked pods (present + recently absent) and assign stable ordinals.
-	type entry struct {
-		key string
-		trackedPod
-	}
-	sorted := make([]entry, 0, len(c.tracked))
-	for key, pod := range c.tracked {
-		sorted = append(sorted, entry{key: key, trackedPod: pod})
-	}
-	sort.Slice(sorted, func(i, j int) bool {
-		a, b := sorted[i], sorted[j]
-		if a.namespace != b.namespace {
-			return a.namespace < b.namespace
-		}
-		if a.stsName != b.stsName {
-			return a.stsName < b.stsName
-		}
-		return a.podOrdinal < b.podOrdinal
-	})
-
-	ordinals := make(map[string]int, len(sorted))
-	for i, e := range sorted {
-		if newArgs.NumShards > 0 {
-			ordinals[e.key] = i % newArgs.NumShards
-		} else {
-			ordinals[e.key] = i
-		}
-	}
-
+	c.lastTargets = newArgs.Targets
 	c.mut.Unlock()
 
 	// Fetch UUIDs for currently-present uncached pods.
@@ -226,60 +324,45 @@ func (c *Component) Update(args component.Arguments) error {
 		wg.Wait()
 	}
 
-	// Build enriched output: currently-present pods only, with cluster_id and ordinal.
-	enriched := make([]discovery.Target, 0, len(newArgs.Targets))
-	for _, t := range newArgs.Targets {
+	c.publishTargets()
+	return nil
+}
+
+// publishTargets recomputes Exports from the current tracked/UUID state and
+// the current Raft-committed assignment, and publishes it. Called from
+// Update (after a discovery refresh) and from reconcile (after an
+// assignment change that happened independently of any discovery refresh).
+func (c *Component) publishTargets() {
+	c.mut.Lock()
+	rawTargets := c.lastTargets
+	uuidCache := make(map[string]string, len(c.uuidCache))
+	for k, v := range c.uuidCache {
+		uuidCache[k] = v
+	}
+	c.mut.Unlock()
+
+	enriched := make([]discovery.Target, 0, len(rawTargets))
+	for _, t := range rawTargets {
 		key := targetKey(t)
 		if key == "" {
 			enriched = append(enriched, t)
 			continue
 		}
-		c.mut.Lock()
-		uuid, hasUUID := c.uuidCache[key]
-		c.mut.Unlock()
+		uuid, hasUUID := uuidCache[key]
 		if !hasUUID {
 			c.opts.Logger.Warn("excluding target with unknown cluster UUID", "key", key)
 			continue
 		}
-		ordinal, ok := ordinals[key]
-		if !ok {
-			continue
+		collector, has := c.node.fsm.collectorOf(key)
+		if !has || collector != c.node.self {
+			continue // not assigned to this replica
 		}
 		builder := discovery.NewTargetBuilderFrom(t)
 		builder.Set("cluster_id", uuid)
-		builder.Set(labelPodOrdinal, strconv.Itoa(ordinal))
 		enriched = append(enriched, builder.Target())
 	}
 
 	c.opts.OnStateChange(Exports{Targets: enriched})
-	return nil
-}
-
-// newTrackedPod extracts stable sort metadata from a newly-discovered target.
-func newTrackedPod(t discovery.Target) trackedPod {
-	ns, _ := t.Get("__meta_kubernetes_namespace")
-	podName, _ := t.Get("__meta_kubernetes_pod_name")
-	stsName, ordinal := parsePodName(podName)
-	return trackedPod{
-		namespace:  ns,
-		stsName:    stsName,
-		podOrdinal: ordinal,
-	}
-}
-
-// parsePodName splits a StatefulSet pod name (e.g. "redpanda-sandbox-2") into
-// the StatefulSet name ("redpanda-sandbox") and numeric ordinal (2) by
-// splitting on the last '-'. Falls back to (podName, 0) for non-conforming names.
-func parsePodName(podName string) (stsName string, ordinal int) {
-	idx := strings.LastIndexByte(podName, '-')
-	if idx < 0 {
-		return podName, 0
-	}
-	n, err := strconv.Atoi(podName[idx+1:])
-	if err != nil {
-		return podName, 0
-	}
-	return podName[:idx], n
 }
 
 func targetKey(t discovery.Target) string {
@@ -343,4 +426,15 @@ func fetchClusterUUID(podIP string, args Arguments) (string, error) {
 	}
 
 	return result.ClusterUUID, nil
+}
+
+// slogWriter adapts component.Options.Logger to the io.Writer Raft wants
+// for its internal logging.
+type slogWriter struct {
+	log interface{ Debug(msg string, args ...any) }
+}
+
+func (w slogWriter) Write(p []byte) (int, error) {
+	w.log.Debug(strings.TrimRight(string(p), "\n"))
+	return len(p), nil
 }
