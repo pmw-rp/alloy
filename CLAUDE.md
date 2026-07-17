@@ -9,7 +9,7 @@ This repo is a fork of [grafana/alloy](https://github.com/grafana/alloy) maintai
 | Component | Path | Notes |
 |---|---|---|
 | `otelcol.exporter.kafka_router` | `internal/component/otelcol/exporter/kafka_router/` | Routes OTLP metrics/logs to Kafka topics via an ordered, templated route list with per-route fallback topics. Stability: `experimental`. |
-| `discovery.redpanda` | `internal/component/discovery/redpanda/` | Enriches discovered pod targets with per-pod Redpanda cluster UUIDs and a stable pod ordinal, for multi-cluster sharding without gossip. Stability: `generally-available`. |
+| `discovery.redpanda` | `internal/component/discovery/redpanda/` | Enriches discovered pod targets with per-pod Redpanda cluster UUIDs, and dynamically allocates brokers to collector replicas via an embedded Raft group (one peer per replica, membership driven by Alloy's native `cluster.Peers()`). Replaces an earlier static `ordinal % NumShards` scheme; there's no toggle back to it, and upgrading an existing deployment needs a coordinated, all-at-once rollout of every replica (see the package doc comment for why). Requires a dedicated `raft_bind_port` per replica, separate from Alloy's own clustering port. Bare-metal/non-Kubernetes discovery sources aren't supported yet. Stability: `generally-available`. |
 | `otelcol.processor.metricsbatcher` | `internal/component/otelcol/processor/metricsbatcher/` | Batches metrics while keeping all data points for the same (resource, metric name) group together, so a histogram series can't be split across batches. Stability: `experimental`. |
 
 Update this table whenever a component is added, renamed, or removed — it's the source of truth for what this fork carries beyond upstream.
