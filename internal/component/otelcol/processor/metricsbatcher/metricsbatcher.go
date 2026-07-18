@@ -42,6 +42,13 @@ type Arguments struct {
 	// even if SendBatchMaxSize has not been reached.
 	Timeout time.Duration `alloy:"timeout,attr,optional"`
 
+	// MaxConcurrentFlushes bounds how many flushes may be in flight at once.
+	// Once reached, a new flush blocks until a slot frees rather than
+	// running unbounded — protects against a slow next consumer with no
+	// internal queue of its own (e.g. otelcol.exporter.kafka_router) piling
+	// up unbounded goroutines, each holding a full batch in memory.
+	MaxConcurrentFlushes int `alloy:"max_concurrent_flushes,attr,optional"`
+
 	// Output configures where to send processed data. Required.
 	Output *otelcol.ConsumerArguments `alloy:"output,block"`
 
@@ -53,8 +60,9 @@ var _ processor.Arguments = Arguments{}
 
 // DefaultArguments holds default settings for Arguments.
 var DefaultArguments = Arguments{
-	SendBatchMaxSize: 8192,
-	Timeout:          10 * time.Second,
+	SendBatchMaxSize:     8192,
+	Timeout:              10 * time.Second,
+	MaxConcurrentFlushes: 4,
 }
 
 // SetToDefault implements syntax.Defaulter.
@@ -71,14 +79,18 @@ func (args *Arguments) Validate() error {
 	if args.Timeout <= 0 {
 		return fmt.Errorf("timeout must be positive, got %v", args.Timeout)
 	}
+	if args.MaxConcurrentFlushes <= 0 {
+		return fmt.Errorf("max_concurrent_flushes must be positive, got %d", args.MaxConcurrentFlushes)
+	}
 	return nil
 }
 
 // Convert implements processor.Arguments. Returns the OTel Config for our processor.
 func (args Arguments) Convert() (otelcomponent.Config, error) {
 	return &Config{
-		SendBatchMaxSize: args.SendBatchMaxSize,
-		Timeout:          args.Timeout,
+		SendBatchMaxSize:     args.SendBatchMaxSize,
+		Timeout:              args.Timeout,
+		MaxConcurrentFlushes: args.MaxConcurrentFlushes,
 	}, nil
 }
 

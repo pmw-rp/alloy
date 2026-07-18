@@ -28,12 +28,23 @@ type Config struct {
 	// Timeout is the maximum time to wait before flushing a non-empty pending
 	// set, even if SendBatchMaxSize has not been reached.
 	Timeout time.Duration `mapstructure:"timeout"`
+
+	// MaxConcurrentFlushes bounds how many flushes (a reconstruct-and-forward
+	// call to the next consumer) may be in flight at once, across both the
+	// size-triggered inline path and the timeout-triggered async path. Once
+	// the cap is reached, a new flush blocks until a slot frees instead of
+	// running unbounded — without this, a next consumer with no internal
+	// queue of its own (e.g. otelcol.exporter.kafka_router, which sends via a
+	// synchronous, blocking produce call) lets a slow send pile up an
+	// unbounded number of goroutines, each holding a full batch in memory.
+	MaxConcurrentFlushes int `mapstructure:"max_concurrent_flushes"`
 }
 
 func defaultConfig() Config {
 	return Config{
-		SendBatchMaxSize: 8192,
-		Timeout:          10 * time.Second,
+		SendBatchMaxSize:     8192,
+		Timeout:              10 * time.Second,
+		MaxConcurrentFlushes: 4,
 	}
 }
 
@@ -153,14 +164,22 @@ type Processor struct {
 	mu      sync.Mutex
 	pending map[groupKey]*dpGroup
 	timer   *time.Timer
+
+	// flushSem bounds concurrent in-flight flushes — see Config.MaxConcurrentFlushes.
+	flushSem chan struct{}
 }
 
 func newProcessor(cfg Config, next metricsConsumer) *Processor {
+	maxFlushes := cfg.MaxConcurrentFlushes
+	if maxFlushes <= 0 {
+		maxFlushes = 1
+	}
 	return &Processor{
 		cfg:          cfg,
 		next:         next,
 		capabilities: consumer.Capabilities{MutatesData: true},
 		pending:      make(map[groupKey]*dpGroup),
+		flushSem:     make(chan struct{}, maxFlushes),
 	}
 }
 
@@ -335,6 +354,17 @@ func (p *Processor) emitGroups(ctx context.Context, groups map[groupKey]*dpGroup
 	if len(groups) == 0 {
 		return nil
 	}
+
+	// Block here, not just around the send below, until a flush slot is
+	// free — this is the one choke point every flush path (size-triggered
+	// inline, timeout-triggered async, and Shutdown's drain) already funnels
+	// through, so it's the natural place to bound total concurrent flushes.
+	select {
+	case p.flushSem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-p.flushSem }()
 
 	// We need to reconstruct ResourceMetrics. Group everything by resourceKey
 	// first, then by metric name within each resource.
