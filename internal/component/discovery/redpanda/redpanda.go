@@ -996,16 +996,24 @@ func assignedToMe(node *raftNode) map[string]bool {
 }
 
 // seedAdmissionGate restores this replica's last-known-good admitted set
-// (see admissionStateAnnotation) intersected with what's currently actually
-// assigned — see the package doc comment's admission control section. A
-// best-effort read: any failure just falls back to the normal empty start
-// (identical to a genuinely first-ever assignment), not a fatal error. If
-// the FSM hasn't fully caught up on the Raft log yet at this point, the
-// intersection may restore less than what was actually persisted — the
-// remainder simply ramps in via the normal one-per-tick growth path once
-// it shows up as assigned on a later tick, no worse than before this
-// existed.
+// (see admissionStateConfigMapSuffix) intersected with what's currently
+// actually assigned — see the package doc comment's admission control
+// section. The intersection is only meaningful once this node's own FSM
+// has actually caught up via Raft log replication, which right after
+// waitAndBuildRaftNode returns hasn't necessarily happened yet (AddVoter
+// and catchup is a real network round trip) — confirmed live: seeding
+// immediately restored nothing at all, every time, because
+// assignedToMe(node) was still completely empty at that exact instant.
+// node.hasState() becoming true confirms this replica is a caught-up
+// voter, so this waits for that first, bounded by raftTimeout; a
+// best-effort wait, not a fatal blocker — proceeding on timeout still
+// falls back to the normal ramp, no worse than not waiting at all.
 func (c *Component) seedAdmissionGate(node *raftNode) {
+	deadline := time.Now().Add(raftTimeout)
+	for !node.hasState() && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+
 	restored, err := readAdmissionState(context.Background(), c.k8sClient, c.k8sNamespace, node.self)
 	if err != nil {
 		c.opts.Logger.Warn("failed to read persisted admission state; starting from empty", "err", err)
