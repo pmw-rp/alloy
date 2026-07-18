@@ -57,6 +57,16 @@ const (
 	// Raft store currently has state — see setHasStateAnnotation and
 	// anyPeerHasState.
 	hasStateAnnotation = "redpanda.alloy.grafana.com/raft-has-state"
+
+	// raftLeavingAnnotation records, on a pod's own object, that it's asked
+	// to be gracefully removed as a Raft voter before it terminates — see
+	// requestGracefulRemoval, votersRequestingRemoval, and redpanda.go's
+	// preStop HTTP handler. Unlike hasStateAnnotation (a passive fact any
+	// replica can read about a sibling), this is a request: the leader
+	// removes any voter marked this way immediately, without waiting for
+	// gossip to notice it's actually gone, so a pod blocked in its own
+	// preStop hook has somewhere to make progress toward.
+	raftLeavingAnnotation = "redpanda.alloy.grafana.com/raft-leaving"
 )
 
 // The bootstrap-election lease's timing. Deliberately vars, not consts, so
@@ -93,9 +103,9 @@ type raftNode struct {
 
 // newRaftNode constructs the embedded Raft peer. If this node has no prior
 // Raft state, it doesn't guess whether that's because no real cluster exists
-// yet or because its own disk was simply never persisted — see claimBootstrap,
-// anyPeerHasState, and reclaimStaleMarker — before concluding it's safe to
-// bootstrap a fresh single-voter cluster.
+// yet or because its own disk was simply never persisted — see
+// decideBootstrap — before concluding it's safe to bootstrap a fresh
+// single-voter cluster.
 //
 // selfName/selfHost identify this node; raftBindPort is a TCP port dedicated
 // to Raft RPC, separate from Alloy's own gossip port (peer.Peer.Addr is the
@@ -400,10 +410,49 @@ func anyPeerHasState(ctx context.Context, clientset kubernetes.Interface, namesp
 // transitions from false to true asynchronously, well after startup) — see
 // redpanda.go's periodic refresh.
 func setHasStateAnnotation(ctx context.Context, clientset kubernetes.Interface, namespace, podName string, hasState bool) error {
+	return setPodAnnotation(ctx, clientset, namespace, podName, hasStateAnnotation, strconv.FormatBool(hasState))
+}
+
+// requestGracefulRemoval marks this pod's own object as asking to be
+// removed as a Raft voter before it terminates — see raftLeavingAnnotation
+// and redpanda.go's preStop HTTP handler, the only caller.
+func requestGracefulRemoval(ctx context.Context, clientset kubernetes.Interface, namespace, podName string) error {
+	return setPodAnnotation(ctx, clientset, namespace, podName, raftLeavingAnnotation, "true")
+}
+
+// votersRequestingRemoval returns the names of any currently-existing pod
+// (same StatefulSet as self, identified by name convention, matching
+// anyPeerHasState's scoping) whose raftLeavingAnnotation is "true" —
+// including self, deliberately: if this replica is both the leader and
+// the one leaving, its own reconcile pass needs to see its own request.
+// reconcileMembership removes every voter in the returned set immediately,
+// without waiting for gossip to notice it's gone.
+func votersRequestingRemoval(ctx context.Context, clientset kubernetes.Interface, namespace, selfName string) (map[string]bool, error) {
+	statefulSetName := statefulSetNameFromPodName(selfName)
+	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("listing pods in namespace %q: %w", namespace, err)
+	}
+	leaving := make(map[string]bool)
+	for _, pod := range pods.Items {
+		if statefulSetNameFromPodName(pod.Name) != statefulSetName {
+			continue
+		}
+		if pod.Annotations[raftLeavingAnnotation] == "true" {
+			leaving[pod.Name] = true
+		}
+	}
+	return leaving, nil
+}
+
+// setPodAnnotation patches a single annotation onto this pod's own object
+// — the shared plumbing behind setHasStateAnnotation and
+// requestGracefulRemoval.
+func setPodAnnotation(ctx context.Context, clientset kubernetes.Interface, namespace, podName, key, value string) error {
 	patch, err := json.Marshal(map[string]any{
 		"metadata": map[string]any{
 			"annotations": map[string]string{
-				hasStateAnnotation: strconv.FormatBool(hasState),
+				key: value,
 			},
 		},
 	})
@@ -412,7 +461,7 @@ func setHasStateAnnotation(ctx context.Context, clientset kubernetes.Interface, 
 	}
 	_, err = clientset.CoreV1().Pods(namespace).Patch(ctx, podName, types.MergePatchType, patch, metav1.PatchOptions{})
 	if err != nil {
-		return fmt.Errorf("patching hasState annotation on pod %q: %w", podName, err)
+		return fmt.Errorf("patching %s annotation on pod %q: %w", key, podName, err)
 	}
 	return nil
 }
@@ -517,12 +566,34 @@ func (n *raftNode) hasReachableQuorum(livePeers []peer.Peer) (bool, error) {
 }
 
 // reconcileMembership adds any gossip peer that isn't yet a Raft voter, and
-// removes any Raft voter that's no longer a gossip peer. AddVoter/RemoveServer
-// are only accepted when called on the current leader — Raft forwards
-// configuration changes through the leader's log — so this is a no-op on
-// followers by construction, not something this function needs to check
-// itself beyond the isLeader() guard.
-func (n *raftNode) reconcileMembership(peers []peer.Peer, raftAddr func(peer.Peer) raft.ServerAddress) error {
+// removes any Raft voter that's no longer a gossip peer — or that's still
+// gossip-visible but has asked to leave (leaving, from
+// votersRequestingRemoval: pod names with raftLeavingAnnotation set,
+// checked here rather than waiting for gossip to notice the pod is
+// actually gone, since a pod blocked in its own preStop hook — see
+// redpanda.go's Handler — stays gossip-visible the entire time it's
+// waiting to be removed). A voter that's leaving is also never re-added
+// even if it's still a gossip peer, so a slow preStop hook doesn't flap
+// between removed and re-added on successive reconcile passes.
+// AddVoter/RemoveServer are only accepted when called on the current
+// leader — Raft forwards configuration changes through the leader's log —
+// so this is a no-op on followers by construction, not something this
+// function needs to check itself beyond the isLeader() guard.
+//
+// If the leader itself needs removing (it's leaving too, or somehow
+// dropped from gossipPeers), that removal is deliberately done last, only
+// after every other pending removal in this pass has already succeeded —
+// removing self any earlier causes an almost-immediate step-down (Raft
+// steps a leader down once it commits a config change excluding itself),
+// which would abort the rest of this pass with a "not leader" error and
+// leave everything else still queued for whichever replica wins the next
+// election. Confirmed live: a bulk departure large enough that the leader
+// was frequently among the departing set needed one election *per voter*
+// to fully drain, chaining past even a generously-scaled timeout. Ordering
+// self-removal last means one leadership term can clear an entire batch
+// of other departures before finally stepping down, needing at most one
+// additional election overall — not one per removed voter.
+func (n *raftNode) reconcileMembership(peers []peer.Peer, raftAddr func(peer.Peer) raft.ServerAddress, leaving map[string]bool) error {
 	if !n.isLeader() {
 		return nil
 	}
@@ -545,19 +616,30 @@ func (n *raftNode) reconcileMembership(peers []peer.Peer, raftAddr func(peer.Pee
 
 	for _, p := range peers {
 		id := raft.ServerID(p.Name)
-		if currentVoters[id] {
+		if currentVoters[id] || leaving[p.Name] {
 			continue
 		}
 		if err := n.raft.AddVoter(id, raftAddr(p), 0, raftTimeout).Error(); err != nil {
 			return fmt.Errorf("adding voter %s: %w", p.Name, err)
 		}
 	}
+
+	removeSelf := false
 	for _, srv := range config.Servers {
-		if gossipPeers[srv.ID] {
+		if gossipPeers[srv.ID] && !leaving[string(srv.ID)] {
+			continue
+		}
+		if string(srv.ID) == n.self {
+			removeSelf = true
 			continue
 		}
 		if err := n.raft.RemoveServer(srv.ID, 0, raftTimeout).Error(); err != nil {
 			return fmt.Errorf("removing server %s: %w", srv.ID, err)
+		}
+	}
+	if removeSelf {
+		if err := n.raft.RemoveServer(raft.ServerID(n.self), 0, raftTimeout).Error(); err != nil {
+			return fmt.Errorf("removing server %s: %w", n.self, err)
 		}
 	}
 	return nil

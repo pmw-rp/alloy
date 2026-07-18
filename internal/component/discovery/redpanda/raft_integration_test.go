@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/grafana/ckit/peer"
 	"github.com/hashicorp/raft"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -184,6 +185,142 @@ func TestRaftBootstrap_SingleBootstrapperThenAddVoter(t *testing.T) {
 	for _, n := range nodes {
 		if n.onChangeCount.Load() == 0 {
 			t.Fatalf("node %s never had its FSM onChange callback fire; a follower with this bug would never republish its targets after an assignment change", n.id)
+		}
+	}
+}
+
+// TestReconcileMembership_RemovesVoterRequestingLeave is the core
+// regression test for graceful scale-down: a voter marked as leaving must
+// be removed even though it's still fully gossip-visible — the whole
+// point being that a pod blocked in its own preStop hook (see redpanda.go's
+// handleLeave) stays gossip-visible for as long as it's waiting to be
+// removed, so waiting for gossip to notice it's gone would never resolve.
+// A second reconcile pass, with the same peer list and the same voter
+// still marked leaving, must not re-add it — no flapping while the
+// preStop hook is still polling for its own removal.
+func TestReconcileMembership_RemovesVoterRequestingLeave(t *testing.T) {
+	ids := []string{"node-a", "node-b", "node-c"}
+	nodes := make([]*testNode, len(ids))
+	for i, id := range ids {
+		nodes[i] = newTestNode(t, id)
+	}
+	connectAll(nodes)
+
+	bootstrapper := nodes[0]
+	if err := bootstrapper.raft.BootstrapCluster(raft.Configuration{
+		Servers: []raft.Server{{ID: raft.ServerID(bootstrapper.id), Address: raft.ServerAddress(bootstrapper.id)}},
+	}).Error(); err != nil {
+		t.Fatalf("BootstrapCluster: %v", err)
+	}
+	leader := awaitLeader(t, nodes, 2*time.Second)
+	for _, n := range nodes {
+		if n.id == leader.id {
+			continue
+		}
+		if err := leader.raft.AddVoter(raft.ServerID(n.id), raft.ServerAddress(n.id), 0, time.Second).Error(); err != nil {
+			t.Fatalf("AddVoter(%s): %v", n.id, err)
+		}
+	}
+	leader = awaitLeader(t, nodes, 2*time.Second)
+
+	n := &raftNode{raft: leader.raft, self: leader.id}
+	peers := []peer.Peer{{Name: "node-a"}, {Name: "node-b"}, {Name: "node-c"}}
+	raftAddr := func(p peer.Peer) raft.ServerAddress { return raft.ServerAddress(p.Name) }
+	leaving := map[string]bool{"node-b": true}
+
+	if err := n.reconcileMembership(peers, raftAddr, leaving); err != nil {
+		t.Fatalf("reconcileMembership: %v", err)
+	}
+	assertVoters := func(want int) []string {
+		voters, err := n.currentVoters()
+		if err != nil {
+			t.Fatalf("currentVoters: %v", err)
+		}
+		for _, v := range voters {
+			if v == "node-b" {
+				t.Fatalf("expected node-b to be removed as a voter despite still being gossip-visible, got voters=%v", voters)
+			}
+		}
+		if len(voters) != want {
+			t.Fatalf("expected %d remaining voters, got %v", want, voters)
+		}
+		return voters
+	}
+	assertVoters(2)
+
+	// A second pass, still gossip-visible and still marked leaving, must
+	// not flap node-b back in.
+	if err := n.reconcileMembership(peers, raftAddr, leaving); err != nil {
+		t.Fatalf("reconcileMembership (second pass): %v", err)
+	}
+	assertVoters(2)
+}
+
+// TestReconcileMembership_RemovesSelfLastWhenLeaderIsAlsoLeaving is the
+// regression test for the real bug found live: a bulk departure large
+// enough that the leader was frequently among the departing set needed
+// one election *per removed voter* to fully drain, since removing self
+// mid-loop caused an immediate step-down that aborted the rest of that
+// pass with a "not leader" error. Here the leader and one other voter are
+// both marked leaving; a single reconcileMembership call must remove both
+// — proving self-removal is deferred until after every other pending
+// removal in the same pass has already succeeded, not interleaved with
+// them in configuration order.
+func TestReconcileMembership_RemovesSelfLastWhenLeaderIsAlsoLeaving(t *testing.T) {
+	ids := []string{"node-a", "node-b", "node-c", "node-d"}
+	nodes := make([]*testNode, len(ids))
+	for i, id := range ids {
+		nodes[i] = newTestNode(t, id)
+	}
+	connectAll(nodes)
+
+	if err := nodes[0].raft.BootstrapCluster(raft.Configuration{
+		Servers: []raft.Server{{ID: raft.ServerID(nodes[0].id), Address: raft.ServerAddress(nodes[0].id)}},
+	}).Error(); err != nil {
+		t.Fatalf("BootstrapCluster: %v", err)
+	}
+	leader := awaitLeader(t, nodes, 2*time.Second)
+	for _, n := range nodes {
+		if n.id == leader.id {
+			continue
+		}
+		if err := leader.raft.AddVoter(raft.ServerID(n.id), raft.ServerAddress(n.id), 0, time.Second).Error(); err != nil {
+			t.Fatalf("AddVoter(%s): %v", n.id, err)
+		}
+	}
+	leader = awaitLeader(t, nodes, 2*time.Second)
+
+	n := &raftNode{raft: leader.raft, self: leader.id}
+	peers := make([]peer.Peer, len(ids))
+	for i, id := range ids {
+		peers[i] = peer.Peer{Name: id}
+	}
+	raftAddr := func(p peer.Peer) raft.ServerAddress { return raft.ServerAddress(p.Name) }
+
+	// The leader itself, plus one other voter, are both leaving.
+	var other string
+	for _, id := range ids {
+		if id != leader.id {
+			other = id
+			break
+		}
+	}
+	leaving := map[string]bool{leader.id: true, other: true}
+
+	if err := n.reconcileMembership(peers, raftAddr, leaving); err != nil {
+		t.Fatalf("reconcileMembership: %v", err)
+	}
+
+	voters, err := n.currentVoters()
+	if err != nil {
+		t.Fatalf("currentVoters: %v", err)
+	}
+	if len(voters) != 2 {
+		t.Fatalf("expected both the leader and the other departing voter removed in a single pass, got %v", voters)
+	}
+	for _, v := range voters {
+		if v == leader.id || v == other {
+			t.Fatalf("expected both %s and %s removed, got voters=%v", leader.id, other, voters)
 		}
 	}
 }
@@ -530,6 +667,55 @@ func TestSetHasStateAnnotation_RoundTrip(t *testing.T) {
 	}
 	if pod.Annotations[hasStateAnnotation] != "false" {
 		t.Fatalf("expected annotation to be false, got %q", pod.Annotations[hasStateAnnotation])
+	}
+}
+
+func podWithAnnotation(name, key, value string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   "collector",
+			Annotations: map[string]string{key: value},
+		},
+	}
+}
+
+// TestRequestGracefulRemoval_RoundTrip verifies the preStop handler's
+// write actually lands on the pod object under raftLeavingAnnotation —
+// see votersRequestingRemoval, the reader side.
+func TestRequestGracefulRemoval_RoundTrip(t *testing.T) {
+	clientset := fake.NewClientset(podWithHasState("collector-collector-alloy-0", nil))
+
+	if err := requestGracefulRemoval(context.Background(), clientset, "collector", "collector-collector-alloy-0"); err != nil {
+		t.Fatalf("requestGracefulRemoval: %v", err)
+	}
+	pod, err := clientset.CoreV1().Pods("collector").Get(context.Background(), "collector-collector-alloy-0", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get pod: %v", err)
+	}
+	if pod.Annotations[raftLeavingAnnotation] != "true" {
+		t.Fatalf("expected raftLeavingAnnotation to be true, got %q", pod.Annotations[raftLeavingAnnotation])
+	}
+}
+
+// TestVotersRequestingRemoval_ScopesAndIncludesSelf covers the read side:
+// only same-StatefulSet pods count, missing/false annotations don't, and —
+// unlike anyPeerHasState — self is deliberately included, since a leader
+// that's also the one leaving needs to see its own request.
+func TestVotersRequestingRemoval_ScopesAndIncludesSelf(t *testing.T) {
+	clientset := fake.NewClientset(
+		podWithAnnotation("collector-collector-alloy-0", raftLeavingAnnotation, "true"), // self, leaving
+		podWithAnnotation("collector-collector-alloy-1", raftLeavingAnnotation, "false"),
+		podWithHasState("collector-collector-alloy-2", nil),             // no annotation at all
+		podWithAnnotation("other-app-0", raftLeavingAnnotation, "true"), // different StatefulSet
+	)
+
+	leaving, err := votersRequestingRemoval(context.Background(), clientset, "collector", "collector-collector-alloy-0")
+	if err != nil {
+		t.Fatalf("votersRequestingRemoval: %v", err)
+	}
+	if len(leaving) != 1 || !leaving["collector-collector-alloy-0"] {
+		t.Fatalf("expected exactly self reported as leaving, got %v", leaving)
 	}
 }
 

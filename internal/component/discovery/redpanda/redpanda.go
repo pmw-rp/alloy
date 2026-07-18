@@ -137,6 +137,7 @@ import (
 	"github.com/grafana/alloy/internal/component/discovery"
 	"github.com/grafana/alloy/internal/featuregate"
 	"github.com/grafana/alloy/internal/service/cluster"
+	httpservice "github.com/grafana/alloy/internal/service/http"
 )
 
 func init() {
@@ -332,6 +333,119 @@ type Component struct {
 }
 
 var _ component.Component = (*Component)(nil)
+var _ httpservice.Component = (*Component)(nil)
+
+// gracefulLeaveTimeout/gracefulLeaveTimeoutPerExtra/gracefulLeaveTimeoutMax
+// size the wait budget handleLeave gives itself — see gracefulLeaveDeadline.
+// Comfortably inside terminationGracePeriodSeconds, which the chart sets
+// accordingly when Clustering is true — kubelet counts preStop hook time
+// against that same budget, not in addition to it. Vars, not consts, so
+// tests can shrink them.
+var (
+	gracefulLeaveTimeout         = 20 * time.Second
+	gracefulLeaveTimeoutPerExtra = 5 * time.Second
+	gracefulLeaveTimeoutMax      = 90 * time.Second
+)
+
+// gracefulLeaveDeadline computes how long handleLeave should wait for this
+// replica to be removed as a voter, scaled by numLeaving — how many
+// voters (including this one) are currently also asking to leave at the
+// same time, from votersRequestingRemoval. A fixed timeout sized for one
+// departure isn't enough for a bulk one: the leader can only remove
+// voters one at a time, and may itself be among the departing set,
+// forcing a leadership handoff partway through. Confirmed live: a 10-to-1
+// scale-down let several preStop hooks time out on a fixed 20s budget
+// before the leader worked through all 9 departures, stranding the
+// survivor below quorum against a configuration that hadn't shrunk to
+// match. Capped at gracefulLeaveTimeoutMax — past that point
+// checkQuorumLoss's own self-restart recovers just as well, so there's no
+// benefit to making a pod hang around in Terminating any longer.
+func gracefulLeaveDeadline(numLeaving int) time.Duration {
+	extra := numLeaving - 1
+	if extra < 0 {
+		extra = 0
+	}
+	d := gracefulLeaveTimeout + time.Duration(extra)*gracefulLeaveTimeoutPerExtra
+	if d > gracefulLeaveTimeoutMax {
+		return gracefulLeaveTimeoutMax
+	}
+	return d
+}
+
+// Handler implements httpservice.Component: Alloy's HTTP service mounts
+// whatever this returns at /api/v0/component/<id>/, so a Kubernetes
+// preStop hook (see the chart) can hit
+// /api/v0/component/discovery.redpanda.pods/leave to trigger a graceful
+// Raft departure before the pod is torn down — see handleLeave.
+func (c *Component) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/leave", c.handleLeave)
+	return mux
+}
+
+// handleLeave implements the preStop side of graceful scale-down: it asks
+// the raft leader (via requestGracefulRemoval's pod annotation —
+// reconcile checks every voter for this on every pass, removing any
+// so-marked immediately rather than waiting for gossip to notice it's
+// gone) to remove this replica as a voter, then blocks until that's
+// actually happened, or gracefulLeaveDeadline elapses, before responding.
+// Kubernetes doesn't send SIGTERM until this handler returns, so — unlike
+// relying on podManagementPolicy or scale-down pacing alone — this makes
+// voter removal happen one at a time no matter how many replicas an
+// operator asks Kubernetes to remove in a single step.
+//
+// A no-op outside clustering mode, or if the raft node was never built
+// (e.g. this replica never found itself in cluster.Peers() — see
+// waitAndBuildRaftNode): there's no voter to remove either way, and
+// blocking pod termination on something that will never happen would
+// just make an ordinary rollout hang.
+func (c *Component) handleLeave(w http.ResponseWriter, r *http.Request) {
+	if !c.clustering {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	c.mut.Lock()
+	node := c.node
+	c.mut.Unlock()
+	if node == nil {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	ctx := r.Context()
+	if err := requestGracefulRemoval(ctx, c.k8sClient, c.k8sNamespace, node.self); err != nil {
+		c.opts.Logger.Warn("failed to request graceful raft removal; proceeding with shutdown anyway", "err", err)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Count simultaneous departures (including this one, just requested
+	// above) to size the wait budget — see gracefulLeaveDeadline. Falls
+	// back to the single-replica budget if this fails; that's the
+	// pre-existing, already-safe behavior, not a new risk.
+	leaving, err := votersRequestingRemoval(ctx, c.k8sClient, c.k8sNamespace, node.self)
+	if err != nil {
+		c.opts.Logger.Warn("failed to count simultaneous departures; using the single-replica leave timeout", "err", err)
+	}
+	timeout := gracefulLeaveDeadline(len(leaving))
+
+	deadline := time.Now().Add(timeout)
+	for node.hasState() {
+		if time.Now().After(deadline) {
+			c.opts.Logger.Warn("timed out waiting to be removed as a raft voter; proceeding with shutdown anyway", "timeout", timeout, "simultaneous_departures", len(leaving))
+			w.WriteHeader(http.StatusGatewayTimeout)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			w.WriteHeader(http.StatusOK)
+			return
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	c.opts.Logger.Info("gracefully left the raft cluster before shutdown")
+	w.WriteHeader(http.StatusOK)
+}
 
 // New creates a new discovery.redpanda component. When args.Clustering is
 // true, it deliberately does not wait to find itself among cluster.Peers(),
@@ -607,10 +721,17 @@ func (c *Component) reconcile() {
 		return
 	}
 
+	leaving, err := votersRequestingRemoval(context.Background(), c.k8sClient, c.k8sNamespace, node.self)
+	if err != nil {
+		c.opts.Logger.Warn("failed to check for voters requesting graceful removal", "err", err)
+		// Proceed without it rather than skipping the whole reconcile pass
+		// — the ordinary gossip-absence removal path below still works.
+	}
+
 	peers := c.cluster.Peers()
 	if err := node.reconcileMembership(peers, func(p peer.Peer) raft.ServerAddress {
 		return raftAddressFor(p, node.advertiseDomain, c.raftBindPort)
-	}); err != nil {
+	}, leaving); err != nil {
 		c.opts.Logger.Warn("failed to reconcile raft membership", "err", err)
 	}
 

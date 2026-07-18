@@ -15,6 +15,8 @@ import (
 	"github.com/grafana/ckit/peer"
 	"github.com/grafana/ckit/shard"
 	"github.com/hashicorp/raft"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/grafana/alloy/internal/component"
 	"github.com/grafana/alloy/internal/component/discovery"
@@ -336,6 +338,239 @@ func TestRun_OrdinalMode_IsNoOp(t *testing.T) {
 
 	if err := c.Run(ctx); err != nil {
 		t.Fatalf("expected Run() to return nil once ctx is done, got: %v", err)
+	}
+}
+
+// TestHandleLeave_NonClusteringModeIsNoOp verifies the preStop handler
+// never blocks pod termination in the default (non-clustering) scheme,
+// where there's no raft voter to remove in the first place.
+func TestHandleLeave_NonClusteringModeIsNoOp(t *testing.T) {
+	c := &Component{opts: component.Options{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
+
+	w := httptest.NewRecorder()
+	c.handleLeave(w, httptest.NewRequest(http.MethodGet, "/leave", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+// TestHandleLeave_NoNodeIsNoOp covers clustering mode before the raft node
+// has been built yet (see waitAndBuildRaftNode) — there's nothing to
+// remove, and blocking an ordinary early-lifecycle pod restart on this
+// would be wrong.
+func TestHandleLeave_NoNodeIsNoOp(t *testing.T) {
+	c := &Component{
+		opts:       component.Options{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))},
+		clustering: true,
+	}
+
+	w := httptest.NewRecorder()
+	c.handleLeave(w, httptest.NewRequest(http.MethodGet, "/leave", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+// threeVoterCluster builds a genuine 3-voter cluster (bootstrap + AddVoter,
+// same pattern as TestReconcileMembership_RemovesVoterRequestingLeave) so
+// removing one voter leaves a well-defined 2-voter majority behind —
+// unlike removing the sole voter from a 1-node cluster, which is a
+// degenerate edge case that doesn't behave like a real multi-replica
+// scale-down. Node IDs deliberately use the real <StatefulSet>-<ordinal>
+// pod-name convention (not "node-a" style), since votersRequestingRemoval
+// scopes siblings by parsing that convention out of the name — a mismatch
+// there would silently exclude every "sibling" and defeat the point of a
+// test exercising it. Returns the elected leader's underlying testNode (so
+// the test can call RemoveServer on it directly, simulating the real
+// leader's reconcile() noticing a leave request) and a *raftNode wrapping
+// "collector-collector-alloy-1".
+func threeVoterCluster(t *testing.T) (leader *testNode, middle *raftNode) {
+	t.Helper()
+	ids := []string{"collector-collector-alloy-0", "collector-collector-alloy-1", "collector-collector-alloy-2"}
+	nodes := make([]*testNode, len(ids))
+	for i, id := range ids {
+		nodes[i] = newTestNode(t, id)
+	}
+	connectAll(nodes)
+
+	if err := nodes[0].raft.BootstrapCluster(raft.Configuration{
+		Servers: []raft.Server{{ID: raft.ServerID(ids[0]), Address: raft.ServerAddress(ids[0])}},
+	}).Error(); err != nil {
+		t.Fatalf("BootstrapCluster: %v", err)
+	}
+	l := awaitLeader(t, nodes, 2*time.Second)
+	for _, n := range nodes {
+		if n.id == l.id {
+			continue
+		}
+		if err := l.raft.AddVoter(raft.ServerID(n.id), raft.ServerAddress(n.id), 0, time.Second).Error(); err != nil {
+			t.Fatalf("AddVoter(%s): %v", n.id, err)
+		}
+	}
+	l = awaitLeader(t, nodes, 2*time.Second)
+
+	var mid *testNode
+	for _, n := range nodes {
+		if n.id == "collector-collector-alloy-1" {
+			mid = n
+		}
+	}
+	return l, &raftNode{raft: mid.raft, self: "collector-collector-alloy-1"}
+}
+
+// TestHandleLeave_SucceedsWhenRemovedPromptly is the core regression test
+// for the preStop mechanism: once the (simulated) leader removes this
+// replica as a voter, the handler must notice via its own hasState() poll
+// and return well before gracefulLeaveTimeout — and it must have actually
+// requested the removal via the pod annotation reconcile() relies on.
+func TestHandleLeave_SucceedsWhenRemovedPromptly(t *testing.T) {
+	orig := gracefulLeaveTimeout
+	defer func() { gracefulLeaveTimeout = orig }()
+	gracefulLeaveTimeout = 3 * time.Second
+
+	leader, node := threeVoterCluster(t)
+	clientset := fake.NewClientset(podWithHasState("collector-collector-alloy-1", nil))
+	c := &Component{
+		opts:         component.Options{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))},
+		clustering:   true,
+		node:         node,
+		k8sClient:    clientset,
+		k8sNamespace: "collector",
+	}
+
+	// Simulates the leader noticing the leave request and removing this
+	// replica as a voter partway through the handler's poll loop.
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_ = leader.raft.RemoveServer(raft.ServerID("collector-collector-alloy-1"), 0, time.Second).Error()
+	}()
+
+	w := httptest.NewRecorder()
+	start := time.Now()
+	c.handleLeave(w, httptest.NewRequest(http.MethodGet, "/leave", nil))
+	elapsed := time.Since(start)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if elapsed >= gracefulLeaveTimeout {
+		t.Fatalf("expected handleLeave to return promptly once removed, took %s", elapsed)
+	}
+
+	pod, err := clientset.CoreV1().Pods("collector").Get(context.Background(), "collector-collector-alloy-1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get pod: %v", err)
+	}
+	if pod.Annotations[raftLeavingAnnotation] != "true" {
+		t.Fatalf("expected raftLeavingAnnotation to be set, got %q", pod.Annotations[raftLeavingAnnotation])
+	}
+}
+
+// TestHandleLeave_TimesOutIfNeverRemoved verifies the handler gives up
+// after gracefulLeaveTimeout rather than hanging forever — if a leader
+// never processes the leave request (e.g. it's also gone), a stuck
+// preStop hook would otherwise wedge the whole pod's termination.
+func TestHandleLeave_TimesOutIfNeverRemoved(t *testing.T) {
+	orig := gracefulLeaveTimeout
+	defer func() { gracefulLeaveTimeout = orig }()
+	gracefulLeaveTimeout = 300 * time.Millisecond
+
+	_, node := threeVoterCluster(t)
+	clientset := fake.NewClientset(podWithHasState("collector-collector-alloy-1", nil))
+	c := &Component{
+		opts:         component.Options{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))},
+		clustering:   true,
+		node:         node,
+		k8sClient:    clientset,
+		k8sNamespace: "collector",
+	}
+	// Deliberately never removed as a voter.
+
+	w := httptest.NewRecorder()
+	c.handleLeave(w, httptest.NewRequest(http.MethodGet, "/leave", nil))
+
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("expected 504, got %d", w.Code)
+	}
+}
+
+// TestGracefulLeaveDeadline_ScalesWithSimultaneousDepartures is a pure
+// unit test of the scaling formula: one departure gets the base budget,
+// each additional simultaneous one adds gracefulLeaveTimeoutPerExtra, and
+// the total never exceeds gracefulLeaveTimeoutMax.
+func TestGracefulLeaveDeadline_ScalesWithSimultaneousDepartures(t *testing.T) {
+	origBase, origExtra, origMax := gracefulLeaveTimeout, gracefulLeaveTimeoutPerExtra, gracefulLeaveTimeoutMax
+	defer func() {
+		gracefulLeaveTimeout, gracefulLeaveTimeoutPerExtra, gracefulLeaveTimeoutMax = origBase, origExtra, origMax
+	}()
+	gracefulLeaveTimeout = 20 * time.Second
+	gracefulLeaveTimeoutPerExtra = 5 * time.Second
+	gracefulLeaveTimeoutMax = 90 * time.Second
+
+	cases := []struct {
+		numLeaving int
+		want       time.Duration
+	}{
+		{0, 20 * time.Second},  // never observed in practice (self always counts), but must not underflow
+		{1, 20 * time.Second},  // the common case: only this replica leaving
+		{3, 30 * time.Second},  // confirmed-safe live: 20 + 2*5
+		{9, 60 * time.Second},  // the bulk case that motivated this: 20 + 8*5
+		{50, 90 * time.Second}, // capped rather than growing unboundedly
+	}
+	for _, c := range cases {
+		if got := gracefulLeaveDeadline(c.numLeaving); got != c.want {
+			t.Errorf("gracefulLeaveDeadline(%d) = %s, want %s", c.numLeaving, got, c.want)
+		}
+	}
+}
+
+// TestHandleLeave_ScalesTimeoutWithSimultaneousDepartures is the
+// regression test for the real bug found live: a 10-to-1 scale-down let
+// several preStop hooks time out on a fixed budget before the leader
+// worked through all 9 departures. Here, two other voters are already
+// marked leaving when this replica's handler starts, so its effective
+// deadline must be scaled up accordingly — removal arrives after the
+// unscaled base timeout would have given up, but before the scaled one.
+func TestHandleLeave_ScalesTimeoutWithSimultaneousDepartures(t *testing.T) {
+	origBase, origExtra, origMax := gracefulLeaveTimeout, gracefulLeaveTimeoutPerExtra, gracefulLeaveTimeoutMax
+	defer func() {
+		gracefulLeaveTimeout, gracefulLeaveTimeoutPerExtra, gracefulLeaveTimeoutMax = origBase, origExtra, origMax
+	}()
+	gracefulLeaveTimeout = 200 * time.Millisecond
+	gracefulLeaveTimeoutPerExtra = 200 * time.Millisecond
+	gracefulLeaveTimeoutMax = 5 * time.Second
+
+	leader, node := threeVoterCluster(t)
+	// ordinals 0 and 2 are already leaving before ordinal 1's handler even
+	// starts — three simultaneous departures, so ordinal 1's own deadline
+	// should be the base plus two extras (600ms), not just the base (200ms).
+	clientset := fake.NewClientset(
+		podWithAnnotation("collector-collector-alloy-0", raftLeavingAnnotation, "true"),
+		podWithHasState("collector-collector-alloy-1", nil),
+		podWithAnnotation("collector-collector-alloy-2", raftLeavingAnnotation, "true"),
+	)
+	c := &Component{
+		opts:         component.Options{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))},
+		clustering:   true,
+		node:         node,
+		k8sClient:    clientset,
+		k8sNamespace: "collector",
+	}
+
+	// Removed at 400ms: after the unscaled 200ms base would have expired,
+	// but before the scaled 600ms deadline.
+	go func() {
+		time.Sleep(400 * time.Millisecond)
+		_ = leader.raft.RemoveServer(raft.ServerID("collector-collector-alloy-1"), 0, time.Second).Error()
+	}()
+
+	w := httptest.NewRecorder()
+	c.handleLeave(w, httptest.NewRequest(http.MethodGet, "/leave", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 (removed within the scaled deadline), got %d", w.Code)
 	}
 }
 
