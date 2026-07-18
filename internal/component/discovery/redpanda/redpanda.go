@@ -125,7 +125,15 @@
 //     flushes_capacity gauges, and computes their ratio. A name-based
 //     coupling (AdmissionControl.FlushMetricsComponentID): Alloy has no
 //     typed reference between unrelated components' Arguments/Exports for
-//     this.
+//     this. Confirmed live: flushes_capacity is recorded the moment
+//     metricsbatcher starts, but flushes_in_flight only gets its first
+//     data point once a flush actually happens — which itself depends on
+//     something having been admitted to scrape. Missing in_flight (with
+//     capacity present) is therefore treated as "definitely idle" (ratio
+//     0), not an error, or a fresh deployment would deadlock permanently:
+//     nothing ever admitted because the health check always fails,
+//     nothing ever flowing through metricsbatcher to produce that first
+//     data point because nothing was ever admitted.
 //   - Every reconcile tick (the same one reconcile()/checkQuorumLoss
 //     already run on, but unlike reconcile() this runs on every replica,
 //     not just the leader — admission is a local capacity decision about

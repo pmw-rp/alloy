@@ -65,9 +65,19 @@ func newFlushHealthReader(opts component.Options, componentID string) (*flushHea
 }
 
 // ratio returns flushes_in_flight / flushes_capacity for the configured
-// component, or an error if either series can't be found yet (e.g. a
-// flush_metrics_component_id typo, or that component hasn't published its
-// first data point).
+// component. Confirmed live: flushes_capacity is recorded eagerly the
+// moment metricsbatcher starts (attachMeter, in that component's
+// processor.go), but flushes_in_flight only gets its first data point once
+// a flush actually happens — which itself depends on discovery.redpanda
+// having admitted something to scrape. Without special-casing that, a
+// fresh deployment deadlocks permanently: nothing is ever admitted because
+// the health check always errors "not found", and nothing ever flows
+// through metricsbatcher to produce that first data point because nothing
+// was ever admitted. So capacity missing is treated as a real error (most
+// likely a flush_metrics_component_id typo, or that component not started
+// yet) — genuinely nothing to compute a ratio from — but in_flight missing
+// while capacity IS present is treated as "definitely idle" (0), the
+// ordinary cold-start case, safe to treat as healthy.
 func (r *flushHealthReader) ratio(ctx context.Context) (float64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.metricsURL, nil)
 	if err != nil {
@@ -88,10 +98,6 @@ func (r *flushHealthReader) ratio(ctx context.Context) (float64, error) {
 		return 0, fmt.Errorf("parsing metrics response: %w", err)
 	}
 
-	inFlight, ok := gaugeValueForComponent(families, admissionFlushMetricInFlight, r.componentID)
-	if !ok {
-		return 0, fmt.Errorf("metric %q not found for component_id %q", admissionFlushMetricInFlight, r.componentID)
-	}
 	capacity, ok := gaugeValueForComponent(families, admissionFlushMetricCapacity, r.componentID)
 	if !ok {
 		return 0, fmt.Errorf("metric %q not found for component_id %q", admissionFlushMetricCapacity, r.componentID)
@@ -99,6 +105,12 @@ func (r *flushHealthReader) ratio(ctx context.Context) (float64, error) {
 	if capacity <= 0 {
 		return 0, fmt.Errorf("metric %q reported non-positive value %v", admissionFlushMetricCapacity, capacity)
 	}
+
+	inFlight, ok := gaugeValueForComponent(families, admissionFlushMetricInFlight, r.componentID)
+	if !ok {
+		inFlight = 0
+	}
+
 	return inFlight / capacity, nil
 }
 
