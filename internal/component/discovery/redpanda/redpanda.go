@@ -1000,16 +1000,24 @@ func assignedToMe(node *raftNode) map[string]bool {
 // actually assigned — see the package doc comment's admission control
 // section. The intersection is only meaningful once this node's own FSM
 // has actually caught up via Raft log replication, which right after
-// waitAndBuildRaftNode returns hasn't necessarily happened yet (AddVoter
-// and catchup is a real network round trip) — confirmed live: seeding
-// immediately restored nothing at all, every time, because
-// assignedToMe(node) was still completely empty at that exact instant.
-// node.hasState() becoming true confirms this replica is a caught-up
-// voter, so this waits for that first, bounded by raftTimeout; a
-// best-effort wait, not a fatal blocker — proceeding on timeout still
-// falls back to the normal ramp, no worse than not waiting at all.
+// waitAndBuildRaftNode returns hasn't necessarily happened yet — confirmed
+// live, twice: seeding immediately restored nothing, because this
+// restarting replica isn't added back as a voter (and so never sees
+// itself in its own configuration — see hasState) until the *leader*
+// notices it via gossip and calls AddVoter, which only happens on the
+// leader's own reconcile tick (reconcileInterval, redpanda.go's Run) —
+// not immediately, and not driven by anything this replica itself does.
+// A first attempt waited for hasState() bounded by raftTimeout (10s, an
+// RPC round-trip constant) and still lost the race, since that's the same
+// order of magnitude as reconcileInterval itself: this replica can restart
+// just after the leader's tick fires, making the leader's *next* tick
+// almost a full reconcileInterval away. Bounded by 2*reconcileInterval
+// instead, comfortably covering that worst case with margin for
+// propagation back to this replica. Still a best-effort wait, not a fatal
+// blocker — proceeding on timeout still falls back to the normal ramp, no
+// worse than not waiting at all.
 func (c *Component) seedAdmissionGate(node *raftNode) {
-	deadline := time.Now().Add(raftTimeout)
+	deadline := time.Now().Add(2 * reconcileInterval)
 	for !node.hasState() && time.Now().Before(deadline) {
 		time.Sleep(50 * time.Millisecond)
 	}
