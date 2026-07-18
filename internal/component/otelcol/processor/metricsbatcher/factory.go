@@ -22,12 +22,15 @@ func NewFactory() processor.Factory {
 
 func createMetricsProcessor(
 	_ context.Context,
-	_ processor.Settings,
+	settings processor.Settings,
 	cfg component.Config,
 	next consumer.Metrics,
 ) (processor.Metrics, error) {
 	c := cfg.(*Config)
 	p := newProcessor(*c, &consumerAdapter{next})
+	if err := p.attachMeter(settings.MeterProvider); err != nil {
+		return nil, err
+	}
 	return &processorAdapter{p}, nil
 }
 

@@ -11,7 +11,27 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
+
+// gaugeValue returns the last recorded value of the named Int64Gauge from a
+// freshly-collected snapshot, or (0, false) if it hasn't been recorded.
+func gaugeValue(t *testing.T, rm *metricdata.ResourceMetrics, name string) (int64, bool) {
+	t.Helper()
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			gauge, ok := m.Data.(metricdata.Gauge[int64])
+			require.True(t, ok, "expected %s to be an int64 gauge", name)
+			require.NotEmpty(t, gauge.DataPoints)
+			return gauge.DataPoints[len(gauge.DataPoints)-1].Value, true
+		}
+	}
+	return 0, false
+}
 
 // blockingConsumer counts how many ConsumeMetrics calls are concurrently
 // in flight, tracks the high-water mark, and blocks each call until release
@@ -145,4 +165,47 @@ func TestNewProcessor_ClampsNonPositiveMaxConcurrentFlushes(t *testing.T) {
 func TestDefaultConfig_HasPositiveMaxConcurrentFlushes(t *testing.T) {
 	cfg := defaultConfig()
 	assert.Greater(t, cfg.MaxConcurrentFlushes, 0)
+}
+
+func TestAttachMeter_ExportsCapacityAndInFlight(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	next := newBlockingConsumer()
+	p := newProcessor(Config{SendBatchMaxSize: 1 << 20, Timeout: time.Hour, MaxConcurrentFlushes: 3}, next)
+	require.NoError(t, p.attachMeter(mp))
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	capacity, ok := gaugeValue(t, &rm, "otelcol_processor_metricsbatcher_flushes_capacity")
+	require.True(t, ok, "flushes_capacity was not exported")
+	assert.EqualValues(t, 3, capacity)
+
+	// Occupy one flush slot and confirm in-flight reflects it before we
+	// collect again.
+	done := make(chan struct{})
+	go func() {
+		_ = p.emitGroups(context.Background(), dummyGroups(1))
+		close(done)
+	}()
+	next.waitForInFlight(t, 1)
+
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	inFlight, ok := gaugeValue(t, &rm, "otelcol_processor_metricsbatcher_flushes_in_flight")
+	require.True(t, ok, "flushes_in_flight was not exported")
+	assert.EqualValues(t, 1, inFlight)
+
+	close(next.release)
+	<-done
+
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	inFlight, ok = gaugeValue(t, &rm, "otelcol_processor_metricsbatcher_flushes_in_flight")
+	require.True(t, ok)
+	assert.EqualValues(t, 0, inFlight, "in-flight should drop back to 0 once the flush completes")
+}
+
+func TestAttachMeter_NilProviderIsNoOp(t *testing.T) {
+	p := newProcessor(Config{SendBatchMaxSize: 8192, Timeout: time.Second, MaxConcurrentFlushes: 2}, newBlockingConsumer())
+	require.NoError(t, p.attachMeter(nil))
+	assert.Nil(t, p.metrics)
 }

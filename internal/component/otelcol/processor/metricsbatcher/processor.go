@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // metricsConsumer is the minimal interface needed by Processor to forward data.
@@ -167,6 +168,62 @@ type Processor struct {
 
 	// flushSem bounds concurrent in-flight flushes — see Config.MaxConcurrentFlushes.
 	flushSem chan struct{}
+
+	// metrics is nil until attachMeter is called (e.g. by tests that
+	// construct a Processor directly) — all recordings are nil-checked.
+	metrics *processorMetrics
+}
+
+// processorMetrics holds the self-observability instruments exposing
+// flush concurrency — how many flushes are currently in flight against the
+// configured MaxConcurrentFlushes ceiling. Without a ceiling to compare
+// against, an in-flight count on its own doesn't tell you how close to
+// saturated the processor is.
+type processorMetrics struct {
+	inFlight metric.Int64Gauge
+}
+
+// attachMeter wires up self-observability instruments from mp and records
+// the configured flush capacity once (it never changes for this Processor's
+// lifetime — Alloy's otelcol wrapper recreates the whole processor, with a
+// fresh metric registry, on every config Update). Safe to skip: a Processor
+// with no metrics attached just doesn't record anything.
+func (p *Processor) attachMeter(mp metric.MeterProvider) error {
+	if mp == nil {
+		return nil
+	}
+	meter := mp.Meter("github.com/grafana/alloy/internal/component/otelcol/processor/metricsbatcher")
+
+	inFlight, err := meter.Int64Gauge(
+		"otelcol_processor_metricsbatcher_flushes_in_flight",
+		metric.WithDescription("Number of flushes (batched sends to the next consumer) currently in flight."),
+	)
+	if err != nil {
+		return fmt.Errorf("creating flushes_in_flight gauge: %w", err)
+	}
+
+	capacity, err := meter.Int64Gauge(
+		"otelcol_processor_metricsbatcher_flushes_capacity",
+		metric.WithDescription("Configured max_concurrent_flushes — the ceiling flushes_in_flight is bounded by."),
+	)
+	if err != nil {
+		return fmt.Errorf("creating flushes_capacity gauge: %w", err)
+	}
+	capacity.Record(context.Background(), int64(cap(p.flushSem)))
+
+	p.metrics = &processorMetrics{inFlight: inFlight}
+	return nil
+}
+
+// recordInFlight reports the current number of held flushSem slots. Called
+// with the slot already acquired/released, so len() reflects the count
+// immediately after the change — an approximate, point-in-time read, which
+// is exactly what a gauge is for.
+func (p *Processor) recordInFlight(ctx context.Context) {
+	if p.metrics == nil {
+		return
+	}
+	p.metrics.inFlight.Record(ctx, int64(len(p.flushSem)))
 }
 
 func newProcessor(cfg Config, next metricsConsumer) *Processor {
@@ -364,7 +421,11 @@ func (p *Processor) emitGroups(ctx context.Context, groups map[groupKey]*dpGroup
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	defer func() { <-p.flushSem }()
+	p.recordInFlight(ctx)
+	defer func() {
+		<-p.flushSem
+		p.recordInFlight(context.Background())
+	}()
 
 	// We need to reconstruct ResourceMetrics. Group everything by resourceKey
 	// first, then by metric name within each resource.
