@@ -747,21 +747,26 @@ func TestRaftNode_HasState(t *testing.T) {
 }
 
 // TestAdmissionState_RoundTrip verifies writeAdmissionState's write lands
-// on the pod object under admissionStateAnnotation, sorted, and that
-// readAdmissionState recovers the same set back out — see
+// in the shared admission-state ConfigMap under podName's own key, sorted,
+// and that readAdmissionState recovers the same set back out — see
 // redpanda.go's seedAdmissionGate, the reader side's only caller.
+// Deliberately a ConfigMap, not a pod annotation like
+// hasStateAnnotation/raftLeavingAnnotation — see admissionStateConfigMapSuffix
+// for why: a pod annotation doesn't survive a full StatefulSet pod
+// recreation, confirmed live, only a container restart within the same
+// still-existing pod.
 func TestAdmissionState_RoundTrip(t *testing.T) {
 	clientset := fake.NewClientset(podWithHasState("collector-collector-alloy-0", nil))
 
 	if err := writeAdmissionState(context.Background(), clientset, "collector", "collector-collector-alloy-0", []string{"b/1", "a/0"}); err != nil {
 		t.Fatalf("writeAdmissionState: %v", err)
 	}
-	pod, err := clientset.CoreV1().Pods("collector").Get(context.Background(), "collector-collector-alloy-0", metav1.GetOptions{})
+	cm, err := clientset.CoreV1().ConfigMaps("collector").Get(context.Background(), "collector-collector-alloy-admission-state", metav1.GetOptions{})
 	if err != nil {
-		t.Fatalf("Get pod: %v", err)
+		t.Fatalf("Get configmap: %v", err)
 	}
-	if got := pod.Annotations[admissionStateAnnotation]; got != "a/0,b/1" {
-		t.Fatalf("expected sorted annotation %q, got %q", "a/0,b/1", got)
+	if got := cm.Data["collector-collector-alloy-0"]; got != "a/0,b/1" {
+		t.Fatalf("expected sorted value %q, got %q", "a/0,b/1", got)
 	}
 
 	restored, err := readAdmissionState(context.Background(), clientset, "collector", "collector-collector-alloy-0")
@@ -773,10 +778,32 @@ func TestAdmissionState_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestReadAdmissionState_NoAnnotationReturnsNilNotError covers the
-// genuinely-fresh-pod / admission-control-just-enabled case: no prior
-// state is not an error condition.
-func TestReadAdmissionState_NoAnnotationReturnsNilNotError(t *testing.T) {
+// TestAdmissionState_PreservesOtherPodsKeys verifies writeAdmissionState
+// only touches its own key in the shared ConfigMap — every replica writes
+// the same object, so a naive overwrite would clobber siblings' state.
+func TestAdmissionState_PreservesOtherPodsKeys(t *testing.T) {
+	clientset := fake.NewClientset(podWithHasState("collector-collector-alloy-0", nil))
+
+	if err := writeAdmissionState(context.Background(), clientset, "collector", "collector-collector-alloy-0", []string{"a/0"}); err != nil {
+		t.Fatalf("writeAdmissionState (pod 0): %v", err)
+	}
+	if err := writeAdmissionState(context.Background(), clientset, "collector", "collector-collector-alloy-1", []string{"a/1"}); err != nil {
+		t.Fatalf("writeAdmissionState (pod 1): %v", err)
+	}
+
+	restored0, err := readAdmissionState(context.Background(), clientset, "collector", "collector-collector-alloy-0")
+	if err != nil {
+		t.Fatalf("readAdmissionState (pod 0): %v", err)
+	}
+	if len(restored0) != 1 || restored0[0] != "a/0" {
+		t.Fatalf("expected pod 0's own state [a/0] to survive pod 1's write, got %v", restored0)
+	}
+}
+
+// TestReadAdmissionState_NoConfigMapReturnsNilNotError covers the
+// genuinely-fresh-StatefulSet / admission-control-just-enabled case: no
+// prior state is not an error condition.
+func TestReadAdmissionState_NoConfigMapReturnsNilNotError(t *testing.T) {
 	clientset := fake.NewClientset(podWithHasState("collector-collector-alloy-0", nil))
 
 	restored, err := readAdmissionState(context.Background(), clientset, "collector", "collector-collector-alloy-0")

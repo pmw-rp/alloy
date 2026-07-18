@@ -144,16 +144,21 @@
 //     steady. One target per tick, deliberately conservative — the
 //     alternative (batch or all-at-once admission) converges faster but
 //     risks a bigger single-step overshoot back into overload.
-//   - The admitted set is persisted onto this replica's own pod
-//     (admissionStateAnnotation, raftnode.go) whenever it changes, and
-//     restored — intersected with whatever's currently actually
-//     assigned, in case ownership moved on while this replica was down —
-//     once at startup (seedAdmissionGate). This is what lets a routine
-//     restart of an already-stable replica resume where it left off
-//     instead of always ramping from empty; it does not replace ongoing
-//     health checks, which resume immediately and will shrink again
-//     within one tick if conditions actually changed while this replica
-//     was down.
+//   - The admitted set is persisted into a shared ConfigMap, one key per
+//     pod name (admissionStateConfigMapSuffix, raftnode.go), whenever it
+//     changes, and restored — intersected with whatever's currently
+//     actually assigned, in case ownership moved on while this replica
+//     was down — once at startup (seedAdmissionGate). A ConfigMap, not a
+//     pod annotation like hasStateAnnotation/raftLeavingAnnotation above:
+//     confirmed live, a pod annotation does not survive a full StatefulSet
+//     pod recreation (a fresh Pod object with none of the previous
+//     incarnation's annotations), only a container restart within the
+//     same still-existing pod — and it's exactly a full recreation this
+//     needs to survive. This is what lets a routine restart of an
+//     already-stable replica resume where it left off instead of always
+//     ramping from empty; it does not replace ongoing health checks,
+//     which resume immediately and will shrink again within one tick if
+//     conditions actually changed while this replica was down.
 //   - The gap between assigned and admitted is published as a gauge
 //     (discovery_redpanda_admission_gap) for an external HPA/KEDA to scale
 //     alloy.replicas on — a persistently nonzero gap is this component's

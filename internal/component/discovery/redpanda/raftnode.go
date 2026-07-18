@@ -69,14 +69,25 @@ const (
 	// preStop hook has somewhere to make progress toward.
 	raftLeavingAnnotation = "redpanda.alloy.grafana.com/raft-leaving"
 
-	// admissionStateAnnotation records, on a pod's own object, this
-	// replica's last-known admitted broker set for admission control (see
-	// admission.go) — comma-separated broker keys, sorted for a stable
-	// diff. Read once at startup (redpanda.go's seedAdmissionGate) so a
-	// routine restart of an already-stable replica resumes where it left
-	// off instead of always ramping from empty; written whenever the
-	// admitted set actually changes.
-	admissionStateAnnotation = "redpanda.alloy.grafana.com/admission-state"
+	// admissionStateConfigMapSuffix names the well-known ConfigMap
+	// (appended to the StatefulSet name, like bootstrapMarkerSuffix) that
+	// records every replica's last-known admitted broker set for admission
+	// control (see admission.go) — one key per pod name, each a
+	// comma-separated, sorted list of broker keys. Read once at startup
+	// (redpanda.go's seedAdmissionGate) so a routine restart of an
+	// already-stable replica resumes where it left off instead of always
+	// ramping from empty; written whenever the admitted set actually
+	// changes. Deliberately a ConfigMap, not a pod annotation like
+	// hasStateAnnotation/raftLeavingAnnotation above: those are written by
+	// the *current* incarnation for *others* to read, so they don't need
+	// to survive that same pod's own restart. This does — restoring a
+	// replica's own past state — and a pod annotation empirically does
+	// not survive a full StatefulSet pod recreation (confirmed live: a
+	// deleted-and-recreated pod gets a brand new object with none of the
+	// previous incarnation's annotations), only a container restart
+	// within the same still-existing pod. A ConfigMap is a separate
+	// object, so it survives regardless of which kind of restart happened.
+	admissionStateConfigMapSuffix = "-admission-state"
 )
 
 // The bootstrap-election lease's timing. Deliberately vars, not consts, so
@@ -455,40 +466,67 @@ func votersRequestingRemoval(ctx context.Context, clientset kubernetes.Interface
 	return leaving, nil
 }
 
-// readAdmissionState reads this pod's own persisted admitted-broker-set
-// annotation — see admissionStateAnnotation. Uses List rather than Get,
-// matching anyPeerHasState/votersRequestingRemoval's pattern elsewhere in
-// this file: the Role this component runs under (templates/direct-role.yaml
-// in the chart) grants list/patch on pods, not get, so every pod-annotation
-// read in this package stays consistent with that one narrower grant.
-// Returns (nil, nil) if the annotation has never been set (a genuinely
-// fresh pod, or admission control just turned on) or the pod itself isn't
-// found, not an error: there's nothing wrong with having no prior state to
-// restore.
+// readAdmissionState reads podName's own persisted admitted-broker-set —
+// see admissionStateConfigMapSuffix. Returns (nil, nil) if the ConfigMap
+// doesn't exist yet (a genuinely fresh StatefulSet, or admission control
+// just turned on) or has no entry for podName yet, not an error: there's
+// nothing wrong with having no prior state to restore.
 func readAdmissionState(ctx context.Context, clientset kubernetes.Interface, namespace, podName string) ([]string, error) {
-	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	name := statefulSetNameFromPodName(podName) + admissionStateConfigMapSuffix
+	cm, err := clientset.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
 	if err != nil {
-		return nil, fmt.Errorf("listing pods in namespace %q: %w", namespace, err)
+		return nil, fmt.Errorf("getting admission state configmap %q: %w", name, err)
 	}
-	for _, pod := range pods.Items {
-		if pod.Name != podName {
-			continue
-		}
-		raw := pod.Annotations[admissionStateAnnotation]
-		if raw == "" {
-			return nil, nil
-		}
-		return strings.Split(raw, ","), nil
+	raw := cm.Data[podName]
+	if raw == "" {
+		return nil, nil
 	}
-	return nil, nil
+	return strings.Split(raw, ","), nil
 }
 
-// writeAdmissionState persists admitted (this replica's current admitted
-// broker set) onto this pod's own object — see admissionStateAnnotation.
+// writeAdmissionState persists admitted (podName's current admitted broker
+// set) into podName's own key in the shared admission-state ConfigMap —
+// see admissionStateConfigMapSuffix. Get-then-Create-or-Update, preserving
+// every other pod's key already in the map: unlike the bootstrap marker
+// (exclusively written by whoever currently holds the bootstrap-election
+// Lease), nothing here serializes concurrent writers, since every replica
+// only ever touches its own key. A losing writer on a rare concurrent
+// conflict just retries on the next reconcile tick (10s later) — the same
+// tolerance this package already applies to other best-effort persistence
+// (see redpanda.go's reconcileAdmission, which only logs a warning on
+// failure here), not a correctness problem.
 func writeAdmissionState(ctx context.Context, clientset kubernetes.Interface, namespace, podName string, admitted []string) error {
 	sorted := append([]string(nil), admitted...)
 	sort.Strings(sorted)
-	return setPodAnnotation(ctx, clientset, namespace, podName, admissionStateAnnotation, strings.Join(sorted, ","))
+	value := strings.Join(sorted, ",")
+
+	name := statefulSetNameFromPodName(podName) + admissionStateConfigMapSuffix
+	cm, err := clientset.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		_, err := clientset.CoreV1().ConfigMaps(namespace).Create(ctx, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Data:       map[string]string{podName: value},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("creating admission state configmap %q: %w", name, err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("getting admission state configmap %q: %w", name, err)
+	}
+
+	if cm.Data == nil {
+		cm.Data = map[string]string{}
+	}
+	cm.Data[podName] = value
+	if _, err := clientset.CoreV1().ConfigMaps(namespace).Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("updating admission state configmap %q: %w", name, err)
+	}
+	return nil
 }
 
 // setPodAnnotation patches a single annotation onto this pod's own object
