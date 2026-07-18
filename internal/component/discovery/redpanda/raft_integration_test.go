@@ -745,3 +745,45 @@ func TestRaftNode_HasState(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestAdmissionState_RoundTrip verifies writeAdmissionState's write lands
+// on the pod object under admissionStateAnnotation, sorted, and that
+// readAdmissionState recovers the same set back out — see
+// redpanda.go's seedAdmissionGate, the reader side's only caller.
+func TestAdmissionState_RoundTrip(t *testing.T) {
+	clientset := fake.NewClientset(podWithHasState("collector-collector-alloy-0", nil))
+
+	if err := writeAdmissionState(context.Background(), clientset, "collector", "collector-collector-alloy-0", []string{"b/1", "a/0"}); err != nil {
+		t.Fatalf("writeAdmissionState: %v", err)
+	}
+	pod, err := clientset.CoreV1().Pods("collector").Get(context.Background(), "collector-collector-alloy-0", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get pod: %v", err)
+	}
+	if got := pod.Annotations[admissionStateAnnotation]; got != "a/0,b/1" {
+		t.Fatalf("expected sorted annotation %q, got %q", "a/0,b/1", got)
+	}
+
+	restored, err := readAdmissionState(context.Background(), clientset, "collector", "collector-collector-alloy-0")
+	if err != nil {
+		t.Fatalf("readAdmissionState: %v", err)
+	}
+	if len(restored) != 2 || restored[0] != "a/0" || restored[1] != "b/1" {
+		t.Fatalf("expected [a/0 b/1], got %v", restored)
+	}
+}
+
+// TestReadAdmissionState_NoAnnotationReturnsNilNotError covers the
+// genuinely-fresh-pod / admission-control-just-enabled case: no prior
+// state is not an error condition.
+func TestReadAdmissionState_NoAnnotationReturnsNilNotError(t *testing.T) {
+	clientset := fake.NewClientset(podWithHasState("collector-collector-alloy-0", nil))
+
+	restored, err := readAdmissionState(context.Background(), clientset, "collector", "collector-collector-alloy-0")
+	if err != nil {
+		t.Fatalf("readAdmissionState: %v", err)
+	}
+	if restored != nil {
+		t.Fatalf("expected nil, got %v", restored)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -67,6 +68,15 @@ const (
 	// gossip to notice it's actually gone, so a pod blocked in its own
 	// preStop hook has somewhere to make progress toward.
 	raftLeavingAnnotation = "redpanda.alloy.grafana.com/raft-leaving"
+
+	// admissionStateAnnotation records, on a pod's own object, this
+	// replica's last-known admitted broker set for admission control (see
+	// admission.go) — comma-separated broker keys, sorted for a stable
+	// diff. Read once at startup (redpanda.go's seedAdmissionGate) so a
+	// routine restart of an already-stable replica resumes where it left
+	// off instead of always ramping from empty; written whenever the
+	// admitted set actually changes.
+	admissionStateAnnotation = "redpanda.alloy.grafana.com/admission-state"
 )
 
 // The bootstrap-election lease's timing. Deliberately vars, not consts, so
@@ -443,6 +453,42 @@ func votersRequestingRemoval(ctx context.Context, clientset kubernetes.Interface
 		}
 	}
 	return leaving, nil
+}
+
+// readAdmissionState reads this pod's own persisted admitted-broker-set
+// annotation — see admissionStateAnnotation. Uses List rather than Get,
+// matching anyPeerHasState/votersRequestingRemoval's pattern elsewhere in
+// this file: the Role this component runs under (templates/direct-role.yaml
+// in the chart) grants list/patch on pods, not get, so every pod-annotation
+// read in this package stays consistent with that one narrower grant.
+// Returns (nil, nil) if the annotation has never been set (a genuinely
+// fresh pod, or admission control just turned on) or the pod itself isn't
+// found, not an error: there's nothing wrong with having no prior state to
+// restore.
+func readAdmissionState(ctx context.Context, clientset kubernetes.Interface, namespace, podName string) ([]string, error) {
+	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("listing pods in namespace %q: %w", namespace, err)
+	}
+	for _, pod := range pods.Items {
+		if pod.Name != podName {
+			continue
+		}
+		raw := pod.Annotations[admissionStateAnnotation]
+		if raw == "" {
+			return nil, nil
+		}
+		return strings.Split(raw, ","), nil
+	}
+	return nil, nil
+}
+
+// writeAdmissionState persists admitted (this replica's current admitted
+// broker set) onto this pod's own object — see admissionStateAnnotation.
+func writeAdmissionState(ctx context.Context, clientset kubernetes.Interface, namespace, podName string, admitted []string) error {
+	sorted := append([]string(nil), admitted...)
+	sort.Strings(sorted)
+	return setPodAnnotation(ctx, clientset, namespace, podName, admissionStateAnnotation, strings.Join(sorted, ","))
 }
 
 // setPodAnnotation patches a single annotation onto this pod's own object

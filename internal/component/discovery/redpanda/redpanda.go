@@ -109,6 +109,50 @@
 // this point), shrinking the gap to at most a brief window of
 // double-scraping rather than a guaranteed hole in collection.
 //
+// Admission control (the AdmissionControl argument, only meaningful when
+// Clustering = true) adds an optional, purely local layer between "the FSM
+// says I own this broker" and "I've published it in Exports.Targets."
+// Raft's job is unchanged — it still only decides ownership. Each replica
+// additionally holds its own admissionGate (admission.go), gating which of
+// its Raft-assigned brokers are actually admitted into published targets
+// based on this replica's own flush-queue health, not admitting everything
+// the instant Raft assigns it:
+//
+//   - Health signal: flushHealthReader scrapes Alloy's own /metrics
+//     endpoint in-process (no real TCP round trip — see
+//     httpservice.Data's DialFunc) for a configured
+//     otelcol.processor.metricsbatcher instance's flushes_in_flight /
+//     flushes_capacity gauges, and computes their ratio. A name-based
+//     coupling (AdmissionControl.FlushMetricsComponentID): Alloy has no
+//     typed reference between unrelated components' Arguments/Exports for
+//     this.
+//   - Every reconcile tick (the same one reconcile()/checkQuorumLoss
+//     already run on, but unlike reconcile() this runs on every replica,
+//     not just the leader — admission is a local capacity decision about
+//     *this* replica, not a cluster-wide ownership one): at or above
+//     HighWatermark, drop the most-recently-admitted broker; at or below
+//     LowWatermark, admit exactly one more from the backlog (assigned but
+//     not yet admitted, in a deterministic sorted order); in between, hold
+//     steady. One target per tick, deliberately conservative — the
+//     alternative (batch or all-at-once admission) converges faster but
+//     risks a bigger single-step overshoot back into overload.
+//   - The admitted set is persisted onto this replica's own pod
+//     (admissionStateAnnotation, raftnode.go) whenever it changes, and
+//     restored — intersected with whatever's currently actually
+//     assigned, in case ownership moved on while this replica was down —
+//     once at startup (seedAdmissionGate). This is what lets a routine
+//     restart of an already-stable replica resume where it left off
+//     instead of always ramping from empty; it does not replace ongoing
+//     health checks, which resume immediately and will shrink again
+//     within one tick if conditions actually changed while this replica
+//     was down.
+//   - The gap between assigned and admitted is published as a gauge
+//     (discovery_redpanda_admission_gap) for an external HPA/KEDA to scale
+//     alloy.replicas on — a persistently nonzero gap is this component's
+//     own signal that it can't safely admit everything it's been asked to
+//     own, decoupling *detection* (this component's job) from *reaction*
+//     (Kubernetes' job).
+//
 // reconcileMembership's one-at-a-time RemoveServer assumes voters depart
 // gradually enough for each removal to commit while the rest of the old
 // configuration is still reachable. Losing more voters at once than that
@@ -144,6 +188,7 @@ import (
 
 	"github.com/grafana/ckit/peer"
 	"github.com/hashicorp/raft"
+	"github.com/prometheus/client_golang/prometheus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
@@ -193,6 +238,10 @@ const (
 	// since a fleet of monitored Redpanda clusters isn't guaranteed to be
 	// uniformly TLS or plaintext.
 	labelAdminTLSEnabled = "__tmp_admin_tls_enabled"
+	// defaultAdmissionHighWatermark/LowWatermark are AdmissionControlArguments'
+	// defaults — see the package doc comment's admission control section.
+	defaultAdmissionHighWatermark = 0.75
+	defaultAdmissionLowWatermark  = 0.5
 )
 
 // quorumLossGrace is how long raftNode.hasReachableQuorum must report a
@@ -236,6 +285,30 @@ type Arguments struct {
 	// pods don't need to be 1:1. Default: 0 (use the raw position). Ignored
 	// when Clustering is true.
 	NumShards int `alloy:"num_shards,attr,optional"`
+	// AdmissionControl gates how many of this replica's Raft-assigned
+	// brokers are actually admitted into published targets, based on local
+	// flush-queue health — see the package doc comment's admission control
+	// section. Only meaningful when Clustering is true; ignored otherwise.
+	AdmissionControl AdmissionControlArguments `alloy:"admission_control,block,optional"`
+}
+
+// AdmissionControlArguments configures discovery.redpanda's optional
+// admission control layer — see the package doc comment.
+type AdmissionControlArguments struct {
+	// Enabled turns admission control on. Default: false.
+	Enabled bool `alloy:"enabled,attr,optional"`
+	// FlushMetricsComponentID names the otelcol.processor.metricsbatcher
+	// component instance whose flushes_in_flight/flushes_capacity gauges
+	// this component reads to decide whether it's safe to admit more (e.g.
+	// "otelcol.processor.metricsbatcher.default"). Required when Enabled.
+	FlushMetricsComponentID string `alloy:"flush_metrics_component_id,attr,optional"`
+	// HighWatermark is the flushes_in_flight/flushes_capacity ratio at or
+	// above which the admission gate drops its most-recently-admitted
+	// broker. Default: 0.75.
+	HighWatermark float64 `alloy:"high_watermark,attr,optional"`
+	// LowWatermark is the ratio at or below which the admission gate
+	// admits one more broker from the backlog. Default: 0.5.
+	LowWatermark float64 `alloy:"low_watermark,attr,optional"`
 }
 
 // Exports holds the enriched targets output.
@@ -344,6 +417,21 @@ type Component struct {
 	// checkQuorumLoss. Zero value means "not currently observed as lost".
 	// Only ever touched from Run()'s single goroutine.
 	quorumLostSince time.Time
+
+	// admissionEnabled/admissionCfg/admissionGate/flushHealth/
+	// admissionGapGauge are only ever populated, and only ever meaningful,
+	// when clustering is true and Arguments.AdmissionControl.Enabled —
+	// see the package doc comment's admission control section. Fixed at
+	// construction (New()), not refreshed by Update() — the same
+	// convention already used for clustering/raftBindPort above.
+	// admissionGate is only ever touched from Run()'s single goroutine;
+	// admissionGapGauge is safe for concurrent use by construction
+	// (prometheus.Gauge).
+	admissionEnabled  bool
+	admissionCfg      AdmissionControlArguments
+	admissionGate     *admissionGate
+	flushHealth       *flushHealthReader
+	admissionGapGauge prometheus.Gauge
 }
 
 var _ component.Component = (*Component)(nil)
@@ -499,6 +587,38 @@ func New(opts component.Options, args Arguments) (*Component, error) {
 			raftBindPort = defaultRaftBindPort
 		}
 		c.raftBindPort = raftBindPort
+
+		if args.AdmissionControl.Enabled {
+			admissionCfg := args.AdmissionControl
+			if admissionCfg.HighWatermark == 0 {
+				admissionCfg.HighWatermark = defaultAdmissionHighWatermark
+			}
+			if admissionCfg.LowWatermark == 0 {
+				admissionCfg.LowWatermark = defaultAdmissionLowWatermark
+			}
+			if admissionCfg.FlushMetricsComponentID == "" {
+				return nil, fmt.Errorf("admission_control.flush_metrics_component_id is required when admission_control.enabled is true")
+			}
+			if !(admissionCfg.LowWatermark > 0 && admissionCfg.LowWatermark < admissionCfg.HighWatermark && admissionCfg.HighWatermark <= 1) {
+				return nil, fmt.Errorf("admission_control requires 0 < low_watermark < high_watermark <= 1, got low_watermark=%v high_watermark=%v", admissionCfg.LowWatermark, admissionCfg.HighWatermark)
+			}
+
+			reader, err := newFlushHealthReader(opts, admissionCfg.FlushMetricsComponentID)
+			if err != nil {
+				return nil, fmt.Errorf("setting up admission control: %w", err)
+			}
+
+			c.admissionGapGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+				Name: "discovery_redpanda_admission_gap",
+				Help: "Brokers currently assigned to this replica but not yet admitted into published targets (assigned minus admitted). A persistently nonzero value signals this replica cannot safely admit everything it owns.",
+			})
+			opts.Registerer.MustRegister(c.admissionGapGauge)
+
+			c.admissionEnabled = true
+			c.admissionCfg = admissionCfg
+			c.admissionGate = newAdmissionGate()
+			c.flushHealth = reader
+		}
 	}
 
 	if err := c.Update(args); err != nil {
@@ -550,6 +670,10 @@ func (c *Component) Run(ctx context.Context) error {
 	c.node = node
 	c.mut.Unlock()
 
+	if c.admissionEnabled {
+		c.seedAdmissionGate(node)
+	}
+
 	// Targets may already be waiting (Update() may have run before the node
 	// existed) — publish now that ownership can actually be determined.
 	c.publishTargets()
@@ -575,6 +699,9 @@ func (c *Component) Run(ctx context.Context) error {
 			c.refreshHasStateAnnotation(node)
 			c.checkQuorumLoss(node)
 			c.reconcile()
+			if c.admissionEnabled {
+				c.reconcileAdmission(ctx, node)
+			}
 		case <-c.publishSignal:
 			c.publishTargets()
 		}
@@ -841,6 +968,78 @@ func (c *Component) refreshEpochHeartbeat(node *raftNode) {
 	}
 }
 
+// assignedToMe returns the set of broker keys the current Raft-committed
+// state assigns to this replica — the admission gate's input backlog, and
+// (when admission control is disabled) exactly what publishTargetsClustered
+// already publishes unconditionally.
+func assignedToMe(node *raftNode) map[string]bool {
+	assigned := make(map[string]bool)
+	for brokerID, a := range node.fsm.snapshotState() {
+		if a.Collector == node.self {
+			assigned[brokerID] = true
+		}
+	}
+	return assigned
+}
+
+// seedAdmissionGate restores this replica's last-known-good admitted set
+// (see admissionStateAnnotation) intersected with what's currently actually
+// assigned — see the package doc comment's admission control section. A
+// best-effort read: any failure just falls back to the normal empty start
+// (identical to a genuinely first-ever assignment), not a fatal error. If
+// the FSM hasn't fully caught up on the Raft log yet at this point, the
+// intersection may restore less than what was actually persisted — the
+// remainder simply ramps in via the normal one-per-tick growth path once
+// it shows up as assigned on a later tick, no worse than before this
+// existed.
+func (c *Component) seedAdmissionGate(node *raftNode) {
+	restored, err := readAdmissionState(context.Background(), c.k8sClient, c.k8sNamespace, node.self)
+	if err != nil {
+		c.opts.Logger.Warn("failed to read persisted admission state; starting from empty", "err", err)
+		return
+	}
+	assigned := assignedToMe(node)
+	c.admissionGate.seed(restored, assigned)
+	c.opts.Logger.Info(
+		"seeded admission gate from persisted state",
+		"restored", len(restored), "kept_after_intersect", len(c.admissionGate.admittedOrder()),
+	)
+}
+
+// reconcileAdmission is the per-replica, per-tick admission control pass —
+// see the package doc comment. Runs on every replica, unlike reconcile()
+// (leader-only): admission is a local capacity decision about this
+// replica's own flush health, not a cluster-wide ownership decision.
+func (c *Component) reconcileAdmission(ctx context.Context, node *raftNode) {
+	assigned := assignedToMe(node)
+
+	ratio, err := c.flushHealth.ratio(ctx)
+	if err != nil {
+		c.opts.Logger.Warn("failed to read flush health signal; holding admission steady this tick", "err", err)
+		// Still let reconcile drop anything no longer assigned even
+		// without a fresh ratio — that's not a health decision. A ratio
+		// strictly between the watermarks makes reconcile grow nothing
+		// and shrink nothing, i.e. hold.
+		ratio = (c.admissionCfg.LowWatermark + c.admissionCfg.HighWatermark) / 2
+	}
+
+	changed := c.admissionGate.reconcile(assigned, ratio, c.admissionCfg)
+	admittedCount := len(c.admissionGate.admittedOrder())
+	c.admissionGapGauge.Set(float64(len(assigned) - admittedCount))
+
+	if changed {
+		if err := writeAdmissionState(ctx, c.k8sClient, c.k8sNamespace, node.self, c.admissionGate.admittedOrder()); err != nil {
+			c.opts.Logger.Warn("failed to persist admission state", "err", err)
+		}
+		c.signalPublish()
+	}
+
+	c.opts.Logger.Info(
+		"admission control pass",
+		"assigned", len(assigned), "admitted", admittedCount, "ratio", ratio, "changed", changed,
+	)
+}
+
 // Update fetches UUIDs for uncached pods, refreshes pod tracking, and
 // publishes the targets this replica currently owns.
 func (c *Component) Update(args component.Arguments) error {
@@ -1088,6 +1287,11 @@ func (c *Component) publishTargetsClustered() {
 	}
 	adminPortStr := strconv.Itoa(adminPort)
 
+	var admitted map[string]bool
+	if c.admissionEnabled {
+		admitted = c.admissionGate.admittedSet()
+	}
+
 	// node is nil until Run() finds this replica in cluster.Peers() and
 	// builds the Raft node (see New()'s doc comment for why that can't
 	// happen synchronously). Until then, and whenever the cluster isn't
@@ -1105,7 +1309,7 @@ func (c *Component) publishTargetsClustered() {
 		return
 	}
 
-	var noUUID, notAssignedToMe, wrongPort int
+	var noUUID, notAssignedToMe, wrongPort, notAdmitted int
 	enriched := make([]discovery.Target, 0, len(rawTargets))
 	for _, t := range rawTargets {
 		key := targetKey(t)
@@ -1138,6 +1342,10 @@ func (c *Component) publishTargetsClustered() {
 			notAssignedToMe++
 			continue // not assigned to this replica
 		}
+		if c.admissionEnabled && !admitted[key] {
+			notAdmitted++
+			continue // assigned to this replica, but not yet (or no longer) admitted — see admission.go
+		}
 		builder := discovery.NewTargetBuilderFrom(t)
 		builder.Set("cluster_id", uuid)
 		builder.Set(labelAdminTLSEnabled, strconv.FormatBool(tlsCache[key]))
@@ -1150,6 +1358,7 @@ func (c *Component) publishTargetsClustered() {
 		"excluded_wrong_port", wrongPort,
 		"excluded_no_uuid", noUUID,
 		"excluded_not_assigned_to_me", notAssignedToMe,
+		"excluded_not_admitted", notAdmitted,
 		"published", len(enriched),
 		"self", node.self,
 	)
