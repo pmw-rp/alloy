@@ -27,6 +27,19 @@ type brokerInfo struct {
 // invariant, re-checked on every call rather than only in response to a
 // collector being freshly added — see rebalance.
 //
+// The grace period is skipped entirely for a collector in leaving (see
+// votersRequestingRemoval): that signal means the departure is deliberate
+// (a graceful scale-down via the preStop hook, not a crash that might come
+// back), so waiting to see if the same name rejoins is pure downside —
+// confirmed live, every scale-down left those brokers unscraped by anyone
+// for the full grace period, since nothing here previously distinguished
+// "gone for good" from "might come right back." leaving's brokers are
+// reassigned on this same pass instead, landing on their new collector
+// before the departing one has even finished shutting down (it's still
+// blocked in its own preStop handler at this point — see redpanda.go's
+// handleLeave), so the gap shrinks to at most a brief window of
+// double-scraping rather than a guaranteed hole in collection.
+//
 // danglingSince tracks, per collector name, the first time it was observed
 // referenced by an assignment but absent from voters; the caller owns and
 // persists this map across calls (it's mutated in place) the same way it
@@ -39,6 +52,7 @@ func reconcileAssignments(
 	voters []string,
 	danglingSince map[string]time.Time,
 	gracePeriod time.Duration,
+	leaving map[string]bool,
 ) []command {
 	voterSet := make(map[string]bool, len(voters))
 	for _, v := range voters {
@@ -116,6 +130,9 @@ func reconcileAssignments(
 		}
 	}
 	dueForReassignment := func(name string) bool {
+		if leaving[name] {
+			return true
+		}
 		since, ok := danglingSince[name]
 		return ok && !now.Before(since.Add(gracePeriod))
 	}

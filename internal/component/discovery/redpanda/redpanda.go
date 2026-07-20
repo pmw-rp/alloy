@@ -95,6 +95,20 @@
 // no command needed at all. Only once that grace period elapses without the
 // replica returning are those brokers actually handed to another collector.
 //
+// That grace period is skipped entirely when the departure is deliberate —
+// a graceful scale-down via the preStop hook (see handleLeave below),
+// signaled the same way reconcileMembership already learns about it:
+// votersRequestingRemoval's leaving set. Confirmed live: without this,
+// every ordinary scale-down left a departing replica's brokers unscraped by
+// anyone for the full grace period, since nothing distinguished "gone for
+// good" from "might come right back" — the two cases the grace period
+// exists to tell apart in the first place. A leaving collector's brokers
+// are reassigned on the very same reconcile pass that removes it as a
+// voter, landing on their new owner before the departing replica has even
+// finished shutting down (it's still blocked in its own preStop handler at
+// this point), shrinking the gap to at most a brief window of
+// double-scraping rather than a guaranteed hole in collection.
+//
 // reconcileMembership's one-at-a-time RemoveServer assumes voters depart
 // gradually enough for each removal to commit while the rest of the old
 // configuration is still reachable. Losing more voters at once than that
@@ -755,7 +769,7 @@ func (c *Component) reconcile() {
 	c.mut.Unlock()
 
 	current := node.fsm.snapshotState()
-	cmds := reconcileAssignments(time.Now(), current, tracked, newVoters, c.danglingCollectorSince, collectorRejoinGrace)
+	cmds := reconcileAssignments(time.Now(), current, tracked, newVoters, c.danglingCollectorSince, collectorRejoinGrace, leaving)
 	for _, cmd := range cmds {
 		if err := node.propose(cmd); err != nil {
 			c.opts.Logger.Warn("failed to propose broker assignment", "err", err, "broker", cmd.BrokerID)

@@ -13,7 +13,7 @@ import (
 // wants, and the behavior reconcileAssignments had before danglingSince and
 // gracePeriod existed at all.
 func reconcileImmediate(current map[string]assignment, tracked map[string]brokerInfo, voters []string) []command {
-	return reconcileAssignments(time.Now(), current, tracked, voters, map[string]time.Time{}, 0)
+	return reconcileAssignments(time.Now(), current, tracked, voters, map[string]time.Time{}, 0, nil)
 }
 
 func applyCommands(current map[string]assignment, cmds []command) map[string]assignment {
@@ -320,7 +320,7 @@ func TestReconcileAssignments_GracePeriodDelaysReassignment(t *testing.T) {
 	const grace = 60 * time.Second
 	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	settled := applyCommands(map[string]assignment{}, reconcileAssignments(base, map[string]assignment{}, tracked, voters, danglingSince, grace))
+	settled := applyCommands(map[string]assignment{}, reconcileAssignments(base, map[string]assignment{}, tracked, voters, danglingSince, grace, nil))
 	originalCollector := settled["b0"].Collector
 	if originalCollector == "" {
 		t.Fatalf("expected b0 to be assigned in the initial pass")
@@ -334,19 +334,19 @@ func TestReconcileAssignments_GracePeriodDelaysReassignment(t *testing.T) {
 	}
 
 	// Immediately after removal: still within grace, must not be reassigned.
-	cmds := reconcileAssignments(base.Add(1*time.Second), settled, tracked, remainingVoters, danglingSince, grace)
+	cmds := reconcileAssignments(base.Add(1*time.Second), settled, tracked, remainingVoters, danglingSince, grace, nil)
 	if len(cmds) != 0 {
 		t.Fatalf("expected no reassignment within the grace period, got %+v", cmds)
 	}
 
 	// Later, but still short of the grace period.
-	cmds = reconcileAssignments(base.Add(grace-time.Second), settled, tracked, remainingVoters, danglingSince, grace)
+	cmds = reconcileAssignments(base.Add(grace-time.Second), settled, tracked, remainingVoters, danglingSince, grace, nil)
 	if len(cmds) != 0 {
 		t.Fatalf("expected no reassignment just before the grace period elapses, got %+v", cmds)
 	}
 
 	// Past the grace period: now it should move to the sole remaining voter.
-	cmds = reconcileAssignments(base.Add(grace+time.Second), settled, tracked, remainingVoters, danglingSince, grace)
+	cmds = reconcileAssignments(base.Add(grace+time.Second), settled, tracked, remainingVoters, danglingSince, grace, nil)
 	if len(cmds) != 1 || cmds[0].Op != opAssign || cmds[0].BrokerID != "b0" || cmds[0].Collector != remainingVoters[0] {
 		t.Fatalf("expected b0 reassigned to %q after the grace period, got %+v", remainingVoters[0], cmds)
 	}
@@ -367,7 +367,7 @@ func TestReconcileAssignments_CollectorReturnsWithinGraceKeepsOriginalAssignment
 	const grace = 60 * time.Second
 	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	settled := applyCommands(map[string]assignment{}, reconcileAssignments(base, map[string]assignment{}, tracked, voters, danglingSince, grace))
+	settled := applyCommands(map[string]assignment{}, reconcileAssignments(base, map[string]assignment{}, tracked, voters, danglingSince, grace, nil))
 	originalCollector := settled["b0"].Collector
 
 	var remainingVoters []string
@@ -378,12 +378,12 @@ func TestReconcileAssignments_CollectorReturnsWithinGraceKeepsOriginalAssignment
 	}
 
 	// Drops out, then rejoins well within the grace period.
-	afterRemoval := applyCommands(settled, reconcileAssignments(base.Add(5*time.Second), settled, tracked, remainingVoters, danglingSince, grace))
+	afterRemoval := applyCommands(settled, reconcileAssignments(base.Add(5*time.Second), settled, tracked, remainingVoters, danglingSince, grace, nil))
 	if afterRemoval["b0"].Collector != originalCollector {
 		t.Fatalf("expected b0 to remain on %q untouched while within grace, got %+v", originalCollector, afterRemoval)
 	}
 
-	cmds := reconcileAssignments(base.Add(10*time.Second), afterRemoval, tracked, voters, danglingSince, grace)
+	cmds := reconcileAssignments(base.Add(10*time.Second), afterRemoval, tracked, voters, danglingSince, grace, nil)
 	if len(cmds) != 0 {
 		t.Fatalf("expected zero commands when the same collector rejoins within its grace period, got %+v", cmds)
 	}
@@ -391,6 +391,109 @@ func TestReconcileAssignments_CollectorReturnsWithinGraceKeepsOriginalAssignment
 	final := applyCommands(afterRemoval, cmds)
 	if final["b0"].Collector != originalCollector {
 		t.Fatalf("expected b0 still on its original collector %q, got %+v", originalCollector, final)
+	}
+}
+
+// TestReconcileAssignments_LeavingBypassesGracePeriod verifies a collector
+// named in leaving has its brokers reassigned on the very next pass, even
+// though the grace period that would otherwise apply hasn't elapsed at all.
+func TestReconcileAssignments_LeavingBypassesGracePeriod(t *testing.T) {
+	tracked := map[string]brokerInfo{
+		"b0": {id: "b0", clusterID: "c0"},
+	}
+	voters := []string{"collector-0", "collector-1"}
+	danglingSince := map[string]time.Time{}
+	const grace = 60 * time.Second
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	settled := applyCommands(map[string]assignment{}, reconcileAssignments(base, map[string]assignment{}, tracked, voters, danglingSince, grace, nil))
+	originalCollector := settled["b0"].Collector
+	if originalCollector == "" {
+		t.Fatalf("expected b0 to be assigned in the initial pass")
+	}
+
+	var remainingVoters []string
+	for _, v := range voters {
+		if v != originalCollector {
+			remainingVoters = append(remainingVoters, v)
+		}
+	}
+
+	// originalCollector drops out and is flagged as deliberately leaving.
+	// Despite this being only 1 second after removal — nowhere near the
+	// 60s grace period — its broker must move immediately.
+	leaving := map[string]bool{originalCollector: true}
+	cmds := reconcileAssignments(base.Add(1*time.Second), settled, tracked, remainingVoters, danglingSince, grace, leaving)
+	if len(cmds) != 1 || cmds[0].Op != opAssign || cmds[0].BrokerID != "b0" || cmds[0].Collector != remainingVoters[0] {
+		t.Fatalf("expected b0 reassigned to %q immediately for a leaving collector, got %+v", remainingVoters[0], cmds)
+	}
+}
+
+// TestReconcileAssignments_NonLeavingDanglingStillWaitsForGrace verifies
+// that leaving being non-empty doesn't change behavior for a dangling
+// collector that isn't in it — e.g. a crash, as opposed to a deliberate
+// scale-down, must still wait out the full grace period.
+func TestReconcileAssignments_NonLeavingDanglingStillWaitsForGrace(t *testing.T) {
+	tracked := map[string]brokerInfo{
+		"b0": {id: "b0", clusterID: "c0"},
+	}
+	voters := []string{"collector-0", "collector-1"}
+	danglingSince := map[string]time.Time{}
+	const grace = 60 * time.Second
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	settled := applyCommands(map[string]assignment{}, reconcileAssignments(base, map[string]assignment{}, tracked, voters, danglingSince, grace, nil))
+	originalCollector := settled["b0"].Collector
+
+	var remainingVoters []string
+	for _, v := range voters {
+		if v != originalCollector {
+			remainingVoters = append(remainingVoters, v)
+		}
+	}
+
+	// leaving is non-empty but doesn't name originalCollector — some other,
+	// unrelated collector is deliberately leaving elsewhere in the fleet.
+	leaving := map[string]bool{"some-other-collector": true}
+	cmds := reconcileAssignments(base.Add(1*time.Second), settled, tracked, remainingVoters, danglingSince, grace, leaving)
+	if len(cmds) != 0 {
+		t.Fatalf("expected no reassignment within the grace period for a non-leaving dangling collector, got %+v", cmds)
+	}
+}
+
+// TestReconcileAssignments_MixedLeavingAndNonLeavingDangling verifies that
+// when one collector is deliberately leaving and another is simultaneously
+// dangling for unrelated reasons (e.g. a crash), only the leaving one's
+// brokers move immediately — the crashed one's still wait out the grace
+// period, on the very same reconcile pass.
+func TestReconcileAssignments_MixedLeavingAndNonLeavingDangling(t *testing.T) {
+	tracked := map[string]brokerInfo{
+		"b0": {id: "b0", clusterID: "c0"},
+		"b1": {id: "b1", clusterID: "c1"},
+	}
+	danglingSince := map[string]time.Time{}
+	const grace = 60 * time.Second
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	current := map[string]assignment{
+		"b0": {Collector: "collector-0", ClusterID: "c0"},
+		"b1": {Collector: "collector-1", ClusterID: "c1"},
+	}
+
+	// collector-0 is deliberately leaving; collector-1 is simultaneously
+	// dangling for some unrelated reason (e.g. crashed, might come back).
+	// Both are absent from voters this pass.
+	remainingVoters := []string{"collector-2"}
+	leaving := map[string]bool{"collector-0": true}
+
+	cmds := reconcileAssignments(base.Add(1*time.Second), current, tracked, remainingVoters, danglingSince, grace, leaving)
+	if len(cmds) != 1 || cmds[0].BrokerID != "b0" || cmds[0].Collector != "collector-2" {
+		t.Fatalf("expected only b0 (leaving collector-0's broker) reassigned to collector-2, got %+v", cmds)
+	}
+
+	after := applyCommands(current, cmds)
+	if after["b1"].Collector != "collector-1" {
+		t.Fatalf("expected b1 to remain on dangling-but-not-leaving collector-1 within grace, got %+v", after["b1"])
 	}
 }
 
