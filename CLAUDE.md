@@ -98,14 +98,14 @@ The Docker image build is fully self-contained — the `Dockerfile` builds the U
 make alloy-image VERSION=v1.17.1-rp ALLOY_IMAGE=<registry>/<image>:<tag>
 ```
 
+- **Multi-platform by default**: this builds `linux/amd64` and `linux/arm64` as one manifest under a single tag, and — since `buildx` can't `--load` a multi-platform result into the local image store — pushes it straight to `ALLOY_IMAGE`'s registry as part of the build. There's no separate `docker push` step for the default case.
+- Requires a `buildx` builder that actually supports multiple platforms, e.g. `docker buildx create --name multiplatform --driver docker-container --use`. The plain `docker` driver builder only builds for the host's own platform.
+- For a faster local-only iteration loop, override with a single platform: `DOCKER_PLATFORM=linux/arm64 make alloy-image ...` — this `--load`s the result into the local image store instead of pushing, matching the old single-arch workflow. Push it yourself once ready: `docker push <registry>/<image>:<tag>`.
 - `VERSION` is baked into the binary (`alloy --version`) and should match the tag from "Tagging convention" above. If `HEAD` has an exact-match `v*` git tag, `scripts/image-tag` infers `VERSION` automatically — passing it explicitly is just for clarity.
-- `ALLOY_IMAGE` only controls the local image tag `docker build` produces; there's no `make push` target. Push manually once the build finishes:
-  ```sh
-  docker push <registry>/<image>:<tag>
-  ```
-- An already-built image can be retagged for a different registry without rebuilding: `docker tag <local-tag> <new-registry>/<image>:<tag>`.
+- Retagging a *single-platform* local image for a different registry without rebuilding still works with `docker tag`. A multi-platform manifest has no single local image to retag this way — combine two already-pushed single-platform images into a new multi-arch tag instead: `docker buildx imagetools create -t <new-tag> <amd64-tag> <arm64-tag>`.
 - Requires `docker login` to whichever registry you're pushing to first.
 - Registry: currently Docker Hub, under `paulmw/alloy`. This is expected to change — update this line when it does.
+- If a build hits `no space left on device` partway through (seen with emulated cross-platform builds — e.g. building `amd64` on an Apple Silicon host under QEMU), that's not necessarily real disk exhaustion: it can be corrupted/exhausted state in the container runtime's own storage (e.g. OrbStack) that doesn't show up in `df`. Building each platform separately (`DOCKER_PLATFORM=linux/amd64 make alloy-image ...`, then again for `arm64`, each to its own temporary tag) and combining them with `docker buildx imagetools create` afterward is a reliable workaround, and also isolates which platform is actually failing.
 
 ## Why merge, not rebase
 

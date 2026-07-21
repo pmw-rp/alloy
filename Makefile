@@ -81,7 +81,11 @@
 ##   RELEASE_BUILD        Set to 1 to build release binaries.
 ##   VERSION              Version to inject into built binaries.
 ##   GO_TAGS              Extra tags to use when building.
-##   DOCKER_PLATFORM      Overrides platform to build Docker images for (defaults to host platform).
+##   DOCKER_PLATFORM      Overrides platform(s) `make alloy-image` builds for (defaults to
+##                        linux/amd64,linux/arm64 as one multi-arch manifest; set to a single
+##                        platform for a faster --load'ed local-only build instead of --push).
+##                        Also used verbatim by alloy-image-windows/prom-gen-image if set
+##                        (those default to the host platform, unlike alloy-image).
 ##   GOEXPERIMENT         Used to enable Go features behind feature flags.
 ##   SKIP_UI_BUILD        Set to 1 to skip the UI build (assumes UI assets already exist).
 ##   SKIP_CODE_GENERATION Set to 1 to skip code generation before building the alloy binary
@@ -288,8 +292,28 @@ endif
 .PHONY: images alloy-image
 images: alloy-image
 
+# alloy-image is multi-platform (linux/amd64 + linux/arm64, one manifest)
+# by default, so a deployment isn't pinned to whichever architecture
+# happened to build it. Override with a single-platform DOCKER_PLATFORM
+# (e.g. DOCKER_PLATFORM=linux/arm64) for a faster local-only iteration
+# loop instead. buildx can't --load a multi-platform result into the
+# local image store, only --push it straight to ALLOY_IMAGE's registry —
+# so the multi-platform default always pushes; a single-platform override
+# --load's locally instead, matching the old single-arch local-build
+# workflow. Requires a buildx builder that actually supports multiple
+# platforms (e.g. `docker buildx create --name multiplatform --driver
+# docker-container --use`) — the plain "docker" driver builder only
+# builds for the host's own platform without one.
+ifeq ($(DOCKER_PLATFORM),)
+ALLOY_IMAGE_PLATFORM_FLAG := --platform=linux/amd64,linux/arm64
+ALLOY_IMAGE_OUTPUT_FLAG   := --push
+else
+ALLOY_IMAGE_PLATFORM_FLAG := --platform=$(DOCKER_PLATFORM)
+ALLOY_IMAGE_OUTPUT_FLAG   := --load
+endif
+
 alloy-image:
-	DOCKER_BUILDKIT=1 docker build $(DOCKER_FLAGS) -t $(ALLOY_IMAGE) -f Dockerfile .
+	docker buildx build --build-arg RELEASE_BUILD=$(RELEASE_BUILD) --build-arg VERSION=$(VERSION) $(ALLOY_IMAGE_PLATFORM_FLAG) -t $(ALLOY_IMAGE) -f Dockerfile $(ALLOY_IMAGE_OUTPUT_FLAG) .
 
 # Test fixture image used by the k8s integration tests as a Prometheus scrape
 # target. The runner builds this alongside alloy-image so the tests don't have
