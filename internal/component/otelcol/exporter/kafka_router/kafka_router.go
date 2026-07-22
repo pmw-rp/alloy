@@ -55,6 +55,7 @@ import (
 	"github.com/grafana/alloy/internal/component/otelcol"
 	"github.com/grafana/alloy/internal/featuregate"
 	"github.com/grafana/alloy/syntax/alloytypes"
+	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
@@ -123,12 +124,15 @@ type SASLArguments struct {
 type Component struct {
 	opts component.Options
 
-	// stateMu guards client, routes, and vars.
+	// stateMu guards client, adm, routes, and vars.
 	// ConsumeMetrics/ConsumeLogs hold a read lock; Update holds a write lock.
 	stateMu sync.RWMutex
 	client  *kgo.Client
+	adm     *kadm.Client
 	routes  []RouteArguments
 	vars    map[string]string
+
+	checker *topicChecker
 }
 
 var (
@@ -140,7 +144,7 @@ var (
 
 // New creates a new kafka_router component.
 func New(opts component.Options, args Arguments) (*Component, error) {
-	c := &Component{opts: opts}
+	c := &Component{opts: opts, checker: newTopicChecker(opts.Logger)}
 	if err := c.Update(args); err != nil {
 		return nil, err
 	}
@@ -149,14 +153,33 @@ func New(opts component.Options, args Arguments) (*Component, error) {
 
 // Run implements component.Component.
 func (c *Component) Run(ctx context.Context) error {
+	go c.checker.run(ctx, func() topicLister {
+		// A nil *kadm.Client boxed into a non-nil topicLister would make
+		// topicChecker.check's adm == nil guard useless, so return a true
+		// nil interface until Update has built a client.
+		adm := c.getAdm()
+		if adm == nil {
+			return nil
+		}
+		return adm
+	})
 	<-ctx.Done()
 	c.stateMu.Lock()
 	if c.client != nil {
 		c.client.Close()
 		c.client = nil
+		c.adm = nil
 	}
 	c.stateMu.Unlock()
 	return nil
+}
+
+// getAdm returns the current admin client, or nil if none is set yet.
+// Passed to topicChecker.run so it always sees the client Update last built.
+func (c *Component) getAdm() *kadm.Client {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+	return c.adm
 }
 
 // Update implements component.Component.  Replaces the Kafka client and
@@ -176,6 +199,7 @@ func (c *Component) Update(args component.Arguments) error {
 	c.stateMu.Lock()
 	oldClient := c.client
 	c.client = client
+	c.adm = kadm.NewClient(client)
 	c.routes = newArgs.Routes
 	c.vars = newArgs.Vars
 	c.stateMu.Unlock()
@@ -276,8 +300,11 @@ func (c *Component) routeAndProduce(
 			errs = append(errs, fmt.Errorf("marshal %s for %s: %w", signal, topic, err))
 			continue
 		}
-		c.opts.Logger.Info("producing record", "signal", signal, "topic", topic, "bytes", len(b), "resources", len(g.indices))
-		if err := produceWithFallback(ctx, client, topic, g.fallback, b, c.opts.Logger); err != nil {
+
+		target, fallback := chooseTarget(c.checker, topic, g.fallback)
+
+		c.opts.Logger.Info("producing record", "signal", signal, "topic", target, "bytes", len(b), "resources", len(g.indices))
+		if err := produceWithFallback(ctx, client, target, fallback, b, c.opts.Logger); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -322,6 +349,21 @@ func resolveRoute(routes []RouteArguments, vars map[string]string, signal string
 	return resolvedRoute{}, false
 }
 
+// chooseTarget decides which topic routeAndProduce should actually produce
+// to for a resolved route. If primary has a fallback configured and hasn't
+// been confirmed to exist, it goes straight to fallback (with no further
+// fallback of its own) instead of discovering primary's absence via a failed
+// produce — franz-go's unknown-topic wait costs real time on every call
+// otherwise. register schedules an off-data-path check; once it confirms
+// primary exists, subsequent calls target it directly.
+func chooseTarget(checker *topicChecker, primary, fallback string) (target, fallbackOut string) {
+	if fallback != "" && !checker.knownToExist(primary) {
+		checker.register(primary)
+		return fallback, ""
+	}
+	return primary, fallback
+}
+
 // produceWithFallback produces payload to topic.  If the produce fails and
 // fallbackTopic is non-empty, it logs a warning and retries on the fallback.
 func produceWithFallback(ctx context.Context, client *kgo.Client, topic, fallbackTopic string, payload []byte, logger *slog.Logger) error {
@@ -362,6 +404,13 @@ func buildFranzClient(args Arguments) (*kgo.Client, error) {
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(args.Brokers...),
 		kgo.ProducerBatchMaxBytes(maxBatchBytes),
+		// A missing primary (route) topic is an expected, designed-for case here —
+		// produceWithFallback immediately retries on fallback_topic. franz-go's
+		// default UnknownTopicRetries (4, gated by a 5s minimum metadata-refresh
+		// interval) assumes a newly-created topic that just needs time to appear,
+		// costing up to ~20s per produce call before giving up. Fail after the
+		// first check instead so the fallback path stays fast.
+		kgo.UnknownTopicRetries(0),
 	}
 
 	codec, err := compressionCodec(args.Compression)
