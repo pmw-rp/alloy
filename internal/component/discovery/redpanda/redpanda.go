@@ -51,14 +51,24 @@ const (
 	fetchTimeout        = 10 * time.Second
 	defaultStaleTimeout = 5 * time.Minute
 	labelPodOrdinal     = "__tmp_pod_ordinal"
+	// labelAdminTLSEnabled is the target label Update attaches alongside
+	// cluster_id, recording whether probeAdminAPI detected this pod's admin
+	// API as speaking TLS ("true"/"false") — a downstream relabel rule maps
+	// this onto __scheme__ so prometheus.scrape picks the right scheme per
+	// target, since a fleet of monitored Redpanda clusters isn't guaranteed
+	// to be uniformly TLS or plaintext.
+	labelAdminTLSEnabled = "__tmp_admin_tls_enabled"
 )
 
 // Arguments configures the discovery.redpanda_uuid component.
 type Arguments struct {
-	Targets       []discovery.Target `alloy:"targets,attr"`
-	AdminPort     int                `alloy:"admin_port,attr,optional"`
-	TLSEnabled    bool               `alloy:"tls_enabled,attr,optional"`
-	TLSSkipVerify bool               `alloy:"tls_skip_verify,attr,optional"`
+	Targets   []discovery.Target `alloy:"targets,attr"`
+	AdminPort int                `alloy:"admin_port,attr,optional"`
+	// TLSSkipVerify skips certificate verification whenever a pod's admin
+	// API turns out to speak TLS — see probeAdminAPI's doc comment for why
+	// there's no tls_enabled counterpart: whether TLS is in use at all is
+	// detected per-pod, not configured.
+	TLSSkipVerify bool `alloy:"tls_skip_verify,attr,optional"`
 	// StaleTimeout is how long a pod that disappears from discovery holds its
 	// ordinal slot before being evicted and triggering renumbering. Default: 5m.
 	StaleTimeout time.Duration `alloy:"stale_timeout,attr,optional"`
@@ -86,6 +96,7 @@ type Component struct {
 	opts      component.Options
 	mut       sync.Mutex
 	uuidCache map[string]string     // key: "namespace/podName" → cluster_uuid
+	tlsCache  map[string]bool       // key: "namespace/podName" → whether probeAdminAPI detected TLS; always set alongside uuidCache
 	tracked   map[string]trackedPod // key → tracking info (survives pod disappearance)
 }
 
@@ -96,6 +107,7 @@ func New(opts component.Options, args Arguments) (*Component, error) {
 	c := &Component{
 		opts:      opts,
 		uuidCache: make(map[string]string),
+		tlsCache:  make(map[string]bool),
 		tracked:   make(map[string]trackedPod),
 	}
 	if err := c.Update(args); err != nil {
@@ -150,6 +162,7 @@ func (c *Component) Update(args component.Arguments) error {
 		if now.Sub(pod.lastSeen) > staleTimeout {
 			delete(c.tracked, key)
 			delete(c.uuidCache, key)
+			delete(c.tlsCache, key)
 			c.opts.Logger.Debug("evicted stale pod", "key", key)
 		}
 	}
@@ -212,14 +225,15 @@ func (c *Component) Update(args component.Arguments) error {
 			wg.Add(1)
 			go func(j fetchJob) {
 				defer wg.Done()
-				uuid, err := fetchClusterUUID(j.podIP, newArgs)
+				uuid, tlsEnabled, err := probeAdminAPI(j.podIP, newArgs)
 				if err != nil {
 					c.opts.Logger.Warn("failed to fetch cluster UUID", "key", j.key, "pod_ip", j.podIP, "err", err)
 					return
 				}
-				c.opts.Logger.Debug("cached cluster UUID", "key", j.key, "uuid", uuid)
+				c.opts.Logger.Debug("cached cluster UUID", "key", j.key, "uuid", uuid, "tls_enabled", tlsEnabled)
 				c.mut.Lock()
 				c.uuidCache[j.key] = uuid
+				c.tlsCache[j.key] = tlsEnabled
 				c.mut.Unlock()
 			}(job)
 		}
@@ -236,6 +250,7 @@ func (c *Component) Update(args component.Arguments) error {
 		}
 		c.mut.Lock()
 		uuid, hasUUID := c.uuidCache[key]
+		tlsEnabled := c.tlsCache[key]
 		c.mut.Unlock()
 		if !hasUUID {
 			c.opts.Logger.Warn("excluding target with unknown cluster UUID", "key", key)
@@ -247,6 +262,7 @@ func (c *Component) Update(args component.Arguments) error {
 		}
 		builder := discovery.NewTargetBuilderFrom(t)
 		builder.Set("cluster_id", uuid)
+		builder.Set(labelAdminTLSEnabled, strconv.FormatBool(tlsEnabled))
 		builder.Set(labelPodOrdinal, strconv.Itoa(ordinal))
 		enriched = append(enriched, builder.Target())
 	}
@@ -295,13 +311,38 @@ type clusterUUIDResponse struct {
 	ClusterUUID string `json:"cluster_uuid"`
 }
 
-func fetchClusterUUID(podIP string, args Arguments) (string, error) {
-	scheme := "http"
-	if args.TLSEnabled {
-		scheme = "https"
+// probeAdminAPI determines a pod's cluster_uuid and, along the way, whether
+// its admin API speaks TLS at all — rather than trusting a single fleet-wide
+// Arguments.TLSEnabled flag, which forces every monitored Redpanda cluster to
+// use the same scheme. Real deployments aren't guaranteed to be uniform (a
+// freshly added cluster might be plaintext while others already have TLS
+// enabled), and getting that one flag wrong for even one cluster silently
+// blocks its brokers from ever resolving a UUID — and therefore from ever
+// being scraped, since Update excludes anything without one.
+//
+// Tries https first (respecting TLSSkipVerify for certificate validation),
+// then falls back to http. Both attempts run against the exact same
+// request path/port — only the scheme (and, for https, TLS verification)
+// differs — so whichever one actually gets a valid cluster_uuid response
+// back is a reliable signal of which scheme this pod's admin API uses, not
+// a guess. The result is cached permanently alongside the UUID itself (see
+// Component.tlsCache) and republished on every target as labelAdminTLSEnabled,
+// for a downstream relabel rule to route each target's actual scrape at the
+// right scheme — see the chart's relabel rules.
+func probeAdminAPI(podIP string, args Arguments) (uuid string, tlsEnabled bool, err error) {
+	uuid, httpsErr := fetchClusterUUID(podIP, args.AdminPort, "https", args.TLSSkipVerify)
+	if httpsErr == nil {
+		return uuid, true, nil
 	}
+	uuid, httpErr := fetchClusterUUID(podIP, args.AdminPort, "http", false)
+	if httpErr == nil {
+		return uuid, false, nil
+	}
+	return "", false, fmt.Errorf("probing admin API via https: %s; via http: %s", httpsErr, httpErr)
+}
 
-	url := fmt.Sprintf("%s://%s:%d/v1/cluster/uuid", scheme, podIP, args.AdminPort)
+func fetchClusterUUID(podIP string, adminPort int, scheme string, tlsSkipVerify bool) (string, error) {
+	url := fmt.Sprintf("%s://%s:%d/v1/cluster/uuid", scheme, podIP, adminPort)
 
 	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 	defer cancel()
@@ -312,7 +353,7 @@ func fetchClusterUUID(podIP string, args Arguments) (string, error) {
 	}
 
 	transport := http.DefaultTransport
-	if args.TLSEnabled && args.TLSSkipVerify {
+	if scheme == "https" && tlsSkipVerify {
 		transport = &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // user-configured
 		}
