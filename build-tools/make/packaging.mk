@@ -142,7 +142,20 @@ ALLOY_ENVIRONMENT_FILE_rpm := /etc/sysconfig/alloy
 ALLOY_ENVIRONMENT_FILE_deb := /etc/default/alloy
 
 # generate_alloy_fpm(deb|rpm, package arch, Alloy arch, output file)
+#
+# packaging/environment-file holds real credentials (KAFKA_PASSWORD) once
+# filled in post-install -- chmod it to 600 here, at package-build time,
+# rather than relying on its mode in the repo: git only tracks
+# executable-or-not, not 600 vs 644, so a plain `chmod 600` committed to
+# the tree would silently revert to a default (usually 644, world-readable)
+# on anyone else's checkout. fpm's `-s dir` input copies each source file's
+# on-disk mode verbatim into the package, so chmod'ing it immediately
+# before invoking fpm, every build, is what actually makes this stick for
+# both the rpm and deb outputs. Confirmed this was otherwise a real gap:
+# an unprivileged user on a test install could `grep KAFKA_PASSWORD
+# /etc/sysconfig/alloy` with no sudo at the previous 644 mode.
 define generate_alloy_fpm =
+	chmod 600 packaging/environment-file && \
 	fpm -s dir -v $(ALLOY_PACKAGE_VERSION) -a $(2) \
 		-n alloy --iteration $(ALLOY_PACKAGE_RELEASE) -f \
 		--log error \

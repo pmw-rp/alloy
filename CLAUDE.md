@@ -107,6 +107,63 @@ make alloy-image VERSION=v1.17.1-rp ALLOY_IMAGE=<registry>/<image>:<tag>
 - Registry: currently Docker Hub, under `paulmw/alloy`. This is expected to change — update this line when it does.
 - If a build hits `no space left on device` partway through (seen with emulated cross-platform builds — e.g. building `amd64` on an Apple Silicon host under QEMU), that's not necessarily real disk exhaustion: it can be corrupted/exhausted state in the container runtime's own storage (e.g. OrbStack) that doesn't show up in `df`. Building each platform separately (`DOCKER_PLATFORM=linux/amd64 make alloy-image ...`, then again for `arm64`, each to its own temporary tag) and combining them with `docker buildx imagetools create` afterward is a reliable workaround, and also isolates which platform is actually failing.
 
+## Bare-metal RPM/DEB: build, distribution, and current state
+
+The Docker image above is for the Kubernetes/Helm deployment path
+(`clients/helm/`). A self-managed (non-Kubernetes) customer instead gets a
+plain RPM/DEB that installs `alloy` as a systemd service on the same host as
+one Redpanda broker — one Alloy process per broker, self-scraping its admin
+API and tailing its own journald logs. This is a completely separate build
+path from the image, documented here since it's easy to lose track of (no
+CI does any of this — see below).
+
+- **What's in the package, beyond the upstream `fpm` packaging machinery**
+  (`build-tools/make/packaging.mk`'s `generate_alloy_fpm`): `packaging/config.alloy`
+  (installed to `/etc/alloy/config.alloy`) and `packaging/environment-file`
+  (installed to `/etc/sysconfig/alloy` for rpm, `/etc/default/alloy` for deb)
+  are both real, maintained-here Redpanda configs, not placeholders —
+  scrape `/metrics`+`/public_metrics` off the broker's own admin API, resolve
+  `cluster_id` via a one-off `/v1/cluster/uuid` probe, tail
+  `_SYSTEMD_UNIT=$REDPANDA_SYSTEMD_UNIT` out of journald, and route both
+  signals through this fork's `otelcol.exporter.kafka_router` to
+  `<customer>-<signal>-<cluster_id>` topics — same shape as
+  `clients/helm/templates/alloy.yaml`'s Kubernetes-side config, minus the
+  Kubernetes-only pieces (`discovery.redpanda`'s pod-metadata enrichment,
+  replaced here by the one-off admin-API probe). The Linux binary is built
+  with the `promtail_journal_enabled` Go tag specifically so
+  `loki.source.journal` is compiled in; `packaging/rpm/control/postinst`
+  adds the `alloy` service user to the `systemd-journal`/`adm` groups so it
+  can actually read it post-install.
+- **Build**: `make dist-alloy-packages-amd64` (or `-arm64`) in this repo,
+  run locally — `dist/alloy-<version>-1.<arch>.rpm`/`.deb`. There is no CI
+  step that does this: this fork's own GitHub Actions
+  (`gh run list -R pmw-rp/alloy`) have only ever run upstream's unrelated
+  scheduled jobs (fuzz tests, dependency checks, issue locking) — none of
+  the `release-*`/`publish-alloy-*` workflows copied over from upstream
+  have ever fired here, and `gh release list -R pmw-rp/alloy` is empty. Any
+  RPM/DEB that exists was built by hand on a dev machine.
+- **Distribution**: manual upload to a public S3 bucket,
+  `s3://lantern-public-904a3f70-d7e8-4723-950d-0baca49f8799/` (`us-west-2`)
+  — not a yum/apt repo, just a direct-download URL
+  (`https://lantern-public-904a3f70-d7e8-4723-950d-0baca49f8799.s3.us-west-2.amazonaws.com/<filename>`).
+  Also manual — no automation uploads here either.
+- **State as of 2026-11-16**: `main` is tagged `v1.17.1-rp-0.2.0-rc-2`
+  (`eca4065dc`), matching the one object currently in that S3 bucket
+  (`alloy-1.17.1-rp-0.2.0-rc-2-1.amd64.rpm`, uploaded 2026-11-04), which is
+  byte-identical to the amd64 RPM already sitting in `dist/` — so nothing
+  has drifted between this repo's current build output and what's been
+  published. A customer downloaded that RPM from S3 and is currently
+  testing it.
+- **Local test rig**: `~/Projects/container-vm`'s `cm` tool runs
+  Docker-based "container machines" (real systemd + sshd, Ubuntu 24.04 or
+  RHEL 9 via `--image rhel-9`) for exactly this kind of test without needing
+  a real bare-metal host. Its `demo/deploy-redpanda` stands up a non-Kubernetes,
+  systemd-managed Redpanda cluster on them the same way a real self-managed
+  customer would run one (`redpanda.service`, not a container/pod) — see
+  that repo's own `README.md` for the full command set
+  (`cm up --image rhel-9 <name>`, `cm ssh/shell <name>`, `cm router` to
+  reach machine ports from the Mac host, etc).
+
 ## Why merge, not rebase
 
 `main` is merged forward from upstream release tags rather than rebased onto them. This means history on `main` is never rewritten: pushes are always plain pushes, never force-pushes, and anyone else with a clone can `git pull` normally. It also means each upstream sync is resolved once, rather than potentially re-resolving the same conflict once per historical commit that touches a shared file.

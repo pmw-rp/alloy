@@ -1,6 +1,22 @@
 // Sample config for Alloy.
 //
 // For a full configuration reference, see https://grafana.com/docs/alloy
+//
+// This sample is written for a single Alloy process self-scraping the one
+// Redpanda broker on the same host (a plain rpm/deb bare-metal install --
+// no Kubernetes). It routes both host and broker metrics to a per-cluster
+// Kafka topic via this fork's custom otelcol.exporter.kafka_router, the
+// same way clients/helm/templates/alloy.yaml does for the Kubernetes case.
+//
+// See packaging/environment-file for the settings this config reads via
+// sys.env(): ADMIN_HOST, ADMIN_PORT, ADMIN_SCHEME, ADMIN_CA_FILE,
+// CUSTOMER_NAME, KAFKA_BROKERS, KAFKA_USERNAME, KAFKA_PASSWORD,
+// KAFKA_SASL_MECHANISM. Fill those in before this does anything useful.
+//
+// otelcol.processor.metricsbatcher and otelcol.exporter.kafka_router are
+// both Stability: experimental (see their own component registration) --
+// packaging/environment-file's CUSTOM_ARGS default includes
+// --stability.level=experimental for exactly this reason.
 logging {
   level = "warn"
 }
@@ -10,6 +26,44 @@ prometheus.exporter.unix "default" {
   disable_collectors       = ["mdadm"]
 }
 
+// Resolve this broker's cluster_id once by probing its own admin API --
+// the same /v1/cluster/uuid endpoint discovery.redpanda's probeAdminAPI
+// hits (internal/component/discovery/redpanda/redpanda.go). We can't reuse
+// that component directly: it hard-requires Kubernetes pod-discovery meta
+// labels (__meta_kubernetes_namespace/_pod_name) to key its UUID cache, and
+// drops or passes through unenriched any target that lacks them -- there's
+// no Kubernetes here, so this reimplements just the one HTTP call it needs,
+// in Alloy config rather than Go.
+//
+// poll_frequency is deliberately long: a cluster's UUID never changes for
+// its lifetime, so there's no reason to hit the admin API more than
+// occasionally just to notice if it restarted with a different identity.
+//
+// ADMIN_HOST defaults to "localhost" (the common case: admin API bound to
+// loopback or 0.0.0.0 on the same host as this collector), but isn't
+// always right -- e.g. a multi-node cluster whose admin listener is bound
+// to that node's own address, not loopback, needs ADMIN_HOST set to it.
+// ADMIN_SCHEME/ADMIN_CA_FILE default to plaintext http with no CA (the
+// simplest case); set ADMIN_SCHEME=https and ADMIN_CA_FILE to the node's
+// truststore if the admin API has TLS enabled. There's no automatic
+// https-then-http fallback the way discovery.redpanda's own probeAdminAPI
+// has (internal/component/discovery/redpanda/redpanda.go) -- that
+// per-pod detection isn't reasonably reimplementable in plain Alloy
+// config, so this sample just takes the scheme as given.
+remote.http "cluster_uuid" {
+  url            = sys.env("ADMIN_SCHEME") + "://" + sys.env("ADMIN_HOST") + ":" + sys.env("ADMIN_PORT") + "/v1/cluster/uuid"
+  poll_frequency = "1h"
+
+  client {
+    tls_config {
+      ca_file = sys.env("ADMIN_CA_FILE")
+    }
+  }
+}
+
+// Scrape this host's own metrics (via prometheus.exporter.unix) and
+// Alloy's self metrics -- always plaintext, unrelated to the admin API's
+// own scheme/TLS settings below.
 prometheus.scrape "default" {
   targets = array.concat(
     prometheus.exporter.unix.default.targets,
@@ -20,8 +74,234 @@ prometheus.scrape "default" {
     }],
   )
 
-  forward_to = [
-  // TODO: components to forward metrics to (like prometheus.remote_write or
-  // prometheus.relabel).
+  forward_to = [otelcol.receiver.prometheus.default.receiver]
+}
+
+// Scrape this broker's own Prometheus metrics (both the full set and the
+// public, customer-facing subset) from its admin API -- kept as its own
+// prometheus.scrape block, separate from "default" above, since its
+// scheme/tls_config (ADMIN_SCHEME/ADMIN_CA_FILE, same reasoning as
+// remote.http.cluster_uuid above) apply to every target in a given
+// prometheus.scrape block uniformly, and shouldn't affect the plaintext
+// host/self targets above.
+prometheus.scrape "redpanda" {
+  // "pod" mirrors clients/helm/templates/alloy.yaml's own "pod" label
+  // (there, __meta_kubernetes_pod_name) so existing dashboards built around
+  // grouping/filtering by "pod" also work for a self-managed install --
+  // without it, every broker's service.instance.id is just its own
+  // ADMIN_HOST:ADMIN_PORT (or worse, "localhost:9644" for every broker if
+  // ADMIN_HOST was left at its default, making brokers indistinguishable).
+  // HOSTNAME comes from the systemd unit (packaging/{rpm,deb}/alloy.service's
+  // Environment=HOSTNAME=%H), not from environment-file -- it's always the
+  // real machine hostname, with no separate configuration needed.
+  targets = [
+    {
+      job              = "redpanda",
+      pod              = sys.env("HOSTNAME"),
+      __address__      = sys.env("ADMIN_HOST") + ":" + sys.env("ADMIN_PORT"),
+      __metrics_path__ = "/metrics",
+    },
+    {
+      // Public (customer-facing) subset -- same broker, different path
+      job              = "redpanda",
+      pod              = sys.env("HOSTNAME"),
+      __address__      = sys.env("ADMIN_HOST") + ":" + sys.env("ADMIN_PORT"),
+      __metrics_path__ = "/public_metrics",
+    },
   ]
+
+  scheme = sys.env("ADMIN_SCHEME")
+
+  tls_config {
+    ca_file = sys.env("ADMIN_CA_FILE")
+  }
+
+  forward_to = [otelcol.receiver.prometheus.default.receiver]
+}
+
+// Convert Prometheus metrics to OpenTelemetry format
+otelcol.receiver.prometheus "default" {
+  output {
+    metrics = [otelcol.processor.transform.add_cluster_id.input]
+  }
+}
+
+// Stamp this broker's cluster_id onto every datapoint's resource
+// attributes, so kafka_router below can route on it. Unlike
+// clients/helm/templates/alloy.yaml (which copies a per-datapoint
+// cluster_id *label* that discovery.redpanda already attached per pod),
+// there's exactly one broker/cluster for this whole process, so the value
+// is a per-reload constant built from remote.http's probed UUID rather
+// than a per-datapoint copy.
+//
+// The JSON parse happens inside the OTTL statement itself (ParseJSON, run
+// per-datapoint, governed by error_mode above), not via Alloy's own
+// encoding.from_json() at config-evaluation time. That distinction matters:
+// encoding.from_json("")["cluster_uuid"] (what remote.http.cluster_uuid.content
+// is before its first successful poll -- e.g. on every boot where
+// alloy.service races redpanda.service, or the admin API is otherwise
+// briefly unreachable) is a fatal Alloy config-load error that crashes the
+// whole process -- confirmed live: "Error: could not perform the initial
+// load successfully", then systemd's restart-limit gives up and alloy stays
+// dead until someone manually restarts it. encoding.to_json() below only
+// JSON-*encodes* the raw content as a safely-escaped OTTL string literal --
+// it never fails, even on "" -- so this expression always evaluates
+// successfully; ParseJSON("") failing is then just a per-datapoint OTTL
+// error that error_mode swallows, leaving cluster_id unset for that round.
+// kafka_router's required_attrs = ["cluster_id"] below already drops
+// anything without it -- this is the intended behavior (no cluster_id, no
+// send), not a bug to fix there.
+otelcol.processor.transform "add_cluster_id" {
+  error_mode = "ignore"
+
+  metric_statements {
+    context    = "resource"
+    statements = [
+      `set(resource.attributes["cluster_id"], ParseJSON(` +
+        encoding.to_json(convert.nonsensitive(remote.http.cluster_uuid.content)) +
+        `)["cluster_uuid"])`,
+    ]
+  }
+
+  output {
+    metrics = [otelcol.processor.metricsbatcher.default.input]
+  }
+}
+
+// Metrics-batch processing: keeps all data points for the same (resource,
+// metric name) together so that Prometheus histogram families
+// (_bucket/_sum/_count) are never split across separate Kafka messages.
+otelcol.processor.metricsbatcher "default" {
+  send_batch_max_size = 5000
+  timeout              = "2s"
+
+  output {
+    metrics = [otelcol.exporter.kafka_router.kafka.input]
+  }
+}
+
+// Tail this broker's own journald logs -- the standard case for a systemd
+// service, confirmed live on a real install (`systemctl show redpanda -p
+// StandardOutput` reports "journal"). Reading the journal needs read
+// access to it: the rpm/deb postinst scripts (packaging/{rpm,deb}/control/
+// postinst) already add the alloy service user to the adm/systemd-journal
+// groups for exactly this, so a real package install needs no extra step
+// -- only a manual/non-package run (as happened while testing this) needs
+// that membership granted by hand.
+loki.source.journal "redpanda" {
+  matches    = "_SYSTEMD_UNIT=" + sys.env("REDPANDA_SYSTEMD_UNIT")
+  forward_to = [loki.relabel.redpanda.receiver]
+}
+
+loki.relabel "redpanda" {
+  forward_to = [otelcol.receiver.loki.default.receiver]
+
+  // Static rule - redpanda source type, mirrors
+  // clients/helm/templates/alloy.yaml's own static rule for the
+  // Kubernetes case.
+  rule {
+    target_label = "redpanda_source"
+    replacement  = "self_managed"
+  }
+
+  // Same "pod" = real hostname convention as prometheus.scrape "redpanda"
+  // above, so logs and metrics for the same broker carry the same label.
+  rule {
+    target_label = "pod"
+    replacement  = sys.env("HOSTNAME")
+  }
+}
+
+// Convert Loki log lines to OpenTelemetry format
+otelcol.receiver.loki "default" {
+  output {
+    logs = [otelcol.processor.transform.add_cluster_id_logs.input]
+  }
+}
+
+// Same cluster_id-stamping technique as add_cluster_id above (a per-reload
+// constant, not a per-entry copy -- there's no per-entry cluster_id label
+// to copy from here, unlike clients/helm/templates/alloy.yaml's
+// discovery.redpanda-fed case), plus the same severity-parsing statements
+// that chart uses, ported verbatim since Redpanda's own log lines already
+// start with one of these exact level names (confirmed live: journald
+// entries read "INFO  2026-11-03 ...", "WARN  ...", etc.).
+// Same ParseJSON-at-OTTL-runtime technique as add_cluster_id above (see its
+// comment) -- a bad/not-yet-successful cluster_uuid probe degrades to "no
+// cluster_id this round" instead of crashing the whole process.
+otelcol.processor.transform "add_cluster_id_logs" {
+  error_mode = "ignore"
+
+  log_statements {
+    context = "log"
+    statements = [
+      `set(resource.attributes["cluster_id"], ParseJSON(` +
+        encoding.to_json(convert.nonsensitive(remote.http.cluster_uuid.content)) +
+        `)["cluster_uuid"])`,
+      `set(log.severity_text, ExtractPatterns(log.body, "^(?P<sev>TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\\s")["sev"]) where IsMatch(log.body, "^(TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\\s")`,
+      `set(log.severity_number, SEVERITY_NUMBER_TRACE) where log.severity_text == "TRACE"`,
+      `set(log.severity_number, SEVERITY_NUMBER_DEBUG) where log.severity_text == "DEBUG"`,
+      `set(log.severity_number, SEVERITY_NUMBER_INFO) where log.severity_text == "INFO"`,
+      `set(log.severity_number, SEVERITY_NUMBER_WARN) where log.severity_text == "WARN"`,
+      `set(log.severity_number, SEVERITY_NUMBER_ERROR) where log.severity_text == "ERROR"`,
+      `set(log.severity_number, SEVERITY_NUMBER_FATAL) where log.severity_text == "FATAL"`,
+    ]
+  }
+
+  output {
+    logs = [otelcol.processor.batch.batcher.input]
+  }
+}
+
+// Log-batch processing before producing -- plain otelcol.processor.batch
+// is fine here (unlike metrics, there's no "keep a metric family together"
+// constraint to preserve), same defaults
+// clients/helm/templates/alloy.yaml uses.
+otelcol.processor.batch "batcher" {
+  timeout             = "2s"
+  send_batch_size     = 10000
+  send_batch_max_size = 10000
+
+  output {
+    logs = [otelcol.exporter.kafka_router.kafka.input]
+  }
+}
+
+// Route metrics AND logs to this cluster's own Kafka topics -- one
+// kafka_router instance handles both signals, since ${signal} in the
+// topic template (below) resolves per-item at produce time to whichever
+// signal actually arrived. ${customer}/${signal}/${cluster_id} are
+// kafka_router's own topic-template placeholders (substituted from vars +
+// resource attributes at produce time, not Alloy config interpolation) --
+// same route shape as clients/helm/templates/alloy.yaml's kafka_router
+// block.
+otelcol.exporter.kafka_router "kafka" {
+  brokers         = string.split(sys.env("KAFKA_BROKERS"), ",")
+  max_batch_bytes = 10485760
+
+  vars = {
+    "customer" = sys.env("CUSTOMER_NAME"),
+  }
+
+  route {
+    topic          = "${customer}-${signal}-${cluster_id}"
+    fallback_topic = "${customer}-${signal}-default"
+    required_attrs = ["cluster_id"]
+  }
+
+  sasl {
+    mechanism = sys.env("KAFKA_SASL_MECHANISM")
+    username  = sys.env("KAFKA_USERNAME")
+    password  = sys.env("KAFKA_PASSWORD")
+  }
+
+  // KAFKA_TLS_CA_FILE defaults to empty, meaning "use the system CA pool"
+  // -- right for a publicly-trusted broker cert (e.g. Redpanda Cloud).
+  // Set it when KAFKA_BROKERS' cert is signed by a private CA instead
+  // (e.g. a self-managed cluster using its own truststore, same reasoning
+  // as ADMIN_CA_FILE above).
+  tls {
+    insecure = false
+    ca_file  = sys.env("KAFKA_TLS_CA_FILE")
+  }
 }

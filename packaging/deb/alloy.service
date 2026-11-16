@@ -1,8 +1,8 @@
 [Unit]
 Description= Vendor-agnostic OpenTelemetry Collector distribution with programmable pipelines
 Documentation=https://grafana.com/docs/alloy
-Wants=network-online.target
-After=network-online.target
+Wants=network-online.target redpanda.service
+After=network-online.target redpanda.service
 
 [Service]
 Restart=always

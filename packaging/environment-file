@@ -10,7 +10,57 @@
 CONFIG_FILE="/etc/alloy/config.alloy"
 
 # User-defined arguments to pass to the run command.
-CUSTOM_ARGS=""
+# --stability.level=experimental is required by config.alloy's use of
+# otelcol.processor.metricsbatcher and otelcol.exporter.kafka_router,
+# which are both registered at Stability: experimental.
+CUSTOM_ARGS="--stability.level=experimental"
 
 # Restart on system upgrade. Defaults to true.
 RESTART_ON_UPGRADE=true
+
+# Redpanda admin API host/port used by config.alloy to probe
+# /v1/cluster/uuid and to scrape this broker's own metrics. ADMIN_HOST
+# defaults to "localhost" -- the common case of an admin listener bound to
+# loopback or 0.0.0.0 on this same host -- but a multi-node cluster whose
+# admin listener is bound to that node's own address (not loopback) needs
+# this set explicitly, e.g. ADMIN_HOST=192.168.1.10.
+ADMIN_HOST="localhost"
+ADMIN_PORT=9644
+
+# Admin API scheme/CA. Defaults to plaintext http with no CA. If the admin
+# API has TLS enabled, set ADMIN_SCHEME=https and ADMIN_CA_FILE to that
+# node's truststore (e.g. /etc/redpanda/certs/truststore.pem) -- there's no
+# automatic TLS detection here, unlike discovery.redpanda's per-pod probe
+# in the Kubernetes case.
+ADMIN_SCHEME="http"
+ADMIN_CA_FILE=""
+
+# systemd unit name config.alloy's loki.source.journal filters on
+# (_SYSTEMD_UNIT=<this>) to tail just this broker's own logs out of the
+# journal, not every other service's.
+REDPANDA_SYSTEMD_UNIT="redpanda.service"
+
+# Customer/tenant name, used to build this broker's Kafka topic name
+# (<customer>-<signal>-<cluster_id>). Required for kafka_router to produce
+# anywhere -- leave unset and it will produce to "-<signal>-<cluster_id>".
+CUSTOMER_NAME=""
+
+# Comma-separated Kafka/Redpanda bootstrap broker(s) kafka_router produces
+# to, e.g. "seed-xxxx.byoc.prd.cloud.redpanda.com:9092".
+KAFKA_BROKERS=""
+
+# SASL credentials for producing to KAFKA_BROKERS. KAFKA_SASL_MECHANISM
+# must match whatever mechanism the customer's Redpanda user was actually
+# created with (kubernetes-workloads/variables.tf's user_mechanism allows
+# either scram-sha-256 or scram-sha-512) -- getting this wrong fails SASL
+# auth outright, so don't assume every customer is on the default.
+KAFKA_USERNAME=""
+KAFKA_PASSWORD=""
+KAFKA_SASL_MECHANISM="SCRAM-SHA-256"
+
+# CA for KAFKA_BROKERS' TLS certificate. Defaults to empty, meaning "use
+# the system CA pool" -- right for a publicly-trusted broker cert. Set
+# this if KAFKA_BROKERS' cert is signed by a private CA instead, e.g.
+# /etc/redpanda/certs/truststore.pem for a self-managed cluster using its
+# own truststore.
+KAFKA_TLS_CA_FILE=""
