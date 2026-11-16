@@ -134,32 +134,38 @@ otelcol.receiver.prometheus "default" {
 // is a per-reload constant built from remote.http's probed UUID rather
 // than a per-datapoint copy.
 //
-// The JSON parse happens inside the OTTL statement itself (ParseJSON, run
-// per-datapoint, governed by error_mode above), not via Alloy's own
-// encoding.from_json() at config-evaluation time. That distinction matters:
-// encoding.from_json("")["cluster_uuid"] (what remote.http.cluster_uuid.content
-// is before its first successful poll -- e.g. on every boot where
-// alloy.service races redpanda.service, or the admin API is otherwise
-// briefly unreachable) is a fatal Alloy config-load error that crashes the
-// whole process -- confirmed live: "Error: could not perform the initial
-// load successfully", then systemd's restart-limit gives up and alloy stays
-// dead until someone manually restarts it. encoding.to_json() below only
-// JSON-*encodes* the raw content as a safely-escaped OTTL string literal --
-// it never fails, even on "" -- so this expression always evaluates
-// successfully; ParseJSON("") failing is then just a per-datapoint OTTL
-// error that error_mode swallows, leaving cluster_id unset for that round.
-// kafka_router's required_attrs = ["cluster_id"] below already drops
-// anything without it -- this is the intended behavior (no cluster_id, no
-// send), not a bug to fix there.
+// remote.http.cluster_uuid.content is "" before its first successful poll --
+// e.g. on every boot where alloy.service races redpanda.service, or the
+// admin API is otherwise briefly unreachable. encoding.from_json("") used to
+// be called directly on that, which is a fatal Alloy config-load error that
+// crashed the whole process -- confirmed live: "Error: could not perform
+// the initial load successfully", then systemd's restart-limit gives up and
+// alloy stays dead until someone manually restarts it.
+//
+// Two coalesce() layers guard this, both confirmed necessary live:
+//   1. coalesce(content, "{}") substitutes a harmless empty JSON object
+//      whenever content is still "" (its zero value), so the from_json
+//      parse always succeeds instead of erroring on "".
+//   2. Indexing that parsed-but-empty map for "cluster_uuid" yields Alloy's
+//      null, and concatenating null into the surrounding string with +
+//      is *itself* a fatal type error ("should be one of [number string
+//      capsule] for binop +, got null") -- also confirmed live. The outer
+//      coalesce(..., "") catches that null and substitutes "" instead.
+// The end result when the probe hasn't succeeded is cluster_id = "" --
+// confirmed via internal/component/otelcol/exporter/kafka_router/
+// kafka_router.go's resolveRoute: required_attrs treats a present-but-empty
+// attribute identically to a missing one (`!ok || v.AsString() == ""`), and
+// drops the record entirely when no route matches -- the correct behavior
+// (no cluster_id, no send), not a bug to fix there.
 otelcol.processor.transform "add_cluster_id" {
   error_mode = "ignore"
 
   metric_statements {
     context    = "resource"
     statements = [
-      `set(resource.attributes["cluster_id"], ParseJSON(` +
-        encoding.to_json(convert.nonsensitive(remote.http.cluster_uuid.content)) +
-        `)["cluster_uuid"])`,
+      "set(resource.attributes[\"cluster_id\"], \"" +
+        coalesce(encoding.from_json(coalesce(convert.nonsensitive(remote.http.cluster_uuid.content), "{}"))["cluster_uuid"], "") +
+        "\")",
     ]
   }
 
@@ -226,18 +232,19 @@ otelcol.receiver.loki "default" {
 // that chart uses, ported verbatim since Redpanda's own log lines already
 // start with one of these exact level names (confirmed live: journald
 // entries read "INFO  2026-11-03 ...", "WARN  ...", etc.).
-// Same ParseJSON-at-OTTL-runtime technique as add_cluster_id above (see its
-// comment) -- a bad/not-yet-successful cluster_uuid probe degrades to "no
-// cluster_id this round" instead of crashing the whole process.
+// Same double-coalesce technique as add_cluster_id above (see its comment)
+// -- a bad/not-yet-successful cluster_uuid probe degrades to cluster_id =
+// "" (dropped by kafka_router's required_attrs) instead of crashing the
+// whole process.
 otelcol.processor.transform "add_cluster_id_logs" {
   error_mode = "ignore"
 
   log_statements {
     context = "log"
     statements = [
-      `set(resource.attributes["cluster_id"], ParseJSON(` +
-        encoding.to_json(convert.nonsensitive(remote.http.cluster_uuid.content)) +
-        `)["cluster_uuid"])`,
+      "set(resource.attributes[\"cluster_id\"], \"" +
+        coalesce(encoding.from_json(coalesce(convert.nonsensitive(remote.http.cluster_uuid.content), "{}"))["cluster_uuid"], "") +
+        "\")",
       `set(log.severity_text, ExtractPatterns(log.body, "^(?P<sev>TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\\s")["sev"]) where IsMatch(log.body, "^(TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\\s")`,
       `set(log.severity_number, SEVERITY_NUMBER_TRACE) where log.severity_text == "TRACE"`,
       `set(log.severity_number, SEVERITY_NUMBER_DEBUG) where log.severity_text == "DEBUG"`,

@@ -3,9 +3,22 @@ Description= Vendor-agnostic OpenTelemetry Collector distribution with programma
 Documentation=https://grafana.com/docs/alloy
 Wants=network-online.target redpanda.service
 After=network-online.target redpanda.service
+# remote.http (used by config.alloy to probe the admin API's cluster UUID)
+# deliberately fails to even build if its first request errors -- upstream's
+# own design, not a bug: see internal/component/remote/http/http.go's
+# Update(), which propagates a failed initial poll so exports are never
+# silently empty. That's fine as long as alloy keeps getting retried until
+# the admin API is actually reachable -- but systemd's default restart-rate
+# limit (5 attempts within 10s) gives up long before Redpanda typically
+# finishes starting, confirmed live: alloy stayed dead
+# ("Start request repeated too quickly") until manually restarted.
+# StartLimitIntervalSec=0 disables that limit entirely, so Restart=always
+# below (with RestartSec's spacing) keeps retrying indefinitely instead.
+StartLimitIntervalSec=0
 
 [Service]
 Restart=always
+RestartSec=5
 User=alloy
 Environment=HOSTNAME=%H
 Environment=ALLOY_DEPLOY_MODE=deb
