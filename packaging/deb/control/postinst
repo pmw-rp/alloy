@@ -41,8 +41,40 @@ case "$1" in
         chown root:"$ALLOY_GROUP" /etc/alloy
         chmod 770 /etc/alloy
 
-        if [ -n "$2" ] && [ "$RESTART_ON_UPGRADE" = "true" ]; then
-            if command -v systemctl 2>/dev/null; then
+        if [ -n "$2" ]; then
+            # config.alloy is logic, not settings -- safe to promote
+            # wholesale from the .dpkg-dist dpkg's --force-confold leaves
+            # behind for a modified conffile. Backed up first in case this
+            # particular install is the exception that customized it.
+            if [ -f /etc/alloy/config.alloy.dpkg-dist ]; then
+                if [ -f /etc/alloy/config.alloy ]; then
+                    cp -p /etc/alloy/config.alloy "/etc/alloy/config.alloy.bak-$(date +%Y%m%d%H%M%S)"
+                fi
+                mv /etc/alloy/config.alloy.dpkg-dist /etc/alloy/config.alloy
+            fi
+
+            # environment-file holds real credentials, so it's never
+            # wholesale-replaced -- only variables the new package defines
+            # that the live file doesn't already have get appended,
+            # idempotently (safe to re-run; a variable only gets added
+            # once, ever).
+            if [ -f /etc/default/alloy.dpkg-dist ]; then
+                grep -oE '^[A-Z_]+=' /etc/default/alloy.dpkg-dist | sed 's/=$//' | sort -u | while IFS= read -r key; do
+                    if ! grep -q "^${key}=" /etc/default/alloy 2>/dev/null; then
+                        value_line=$(grep "^${key}=" /etc/default/alloy.dpkg-dist | head -n1)
+                        printf '\n# Added automatically on upgrade (%s) from the new package template:\n%s\n' \
+                            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$value_line" >> /etc/default/alloy
+                    fi
+                done
+                rm -f /etc/default/alloy.dpkg-dist
+            fi
+
+            # An upgrade never retroactively fixes an existing file's
+            # permissions on its own -- confirmed live, re-assert every
+            # upgrade regardless of whether the block above added anything.
+            chmod 600 /etc/default/alloy
+
+            if [ "$RESTART_ON_UPGRADE" = "true" ] && command -v systemctl 2>/dev/null; then
                 systemctl daemon-reload
                 systemctl restart alloy
             fi

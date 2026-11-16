@@ -160,9 +160,9 @@ define generate_alloy_fpm =
 		-n alloy --iteration $(ALLOY_PACKAGE_RELEASE) -f \
 		--log error \
 		--license "Apache 2.0" \
-		--vendor "Grafana Labs" \
-		--url "https://github.com/grafana/alloy" \
-		--description "Grafana Alloy is an OpenTelemetry Collector distribution with programmable pipelines." \
+		--vendor "Redpanda Data" \
+		--url "https://github.com/pmw-rp/alloy" \
+		--description "Grafana Alloy (Lantern fork) is an OpenTelemetry Collector distribution with programmable pipelines." \
 		--rpm-digest sha256 \
 		-t $(1) \
 		--after-install packaging/$(1)/control/postinst \

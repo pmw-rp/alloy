@@ -47,6 +47,38 @@ if [ "$1" -eq 1 ] ; then
 elif [ "$1" -ge 2 ] ; then
     add_to_logging_groups
 
+    # config.alloy is logic, not settings -- safe to promote wholesale from
+    # the .rpmnew the file-install phase already left behind (RPM lays down
+    # files, including .rpmnew candidates for modified noreplace configs,
+    # before running this scriptlet). Backed up first in case this
+    # particular install is the exception that customized it.
+    if [ -f /etc/alloy/config.alloy.rpmnew ]; then
+        if [ -f /etc/alloy/config.alloy ]; then
+            cp -p /etc/alloy/config.alloy "/etc/alloy/config.alloy.bak-$(date +%%Y%%m%%d%%H%%M%%S)"
+        fi
+        mv /etc/alloy/config.alloy.rpmnew /etc/alloy/config.alloy
+    fi
+
+    # environment-file holds real credentials, so it's never wholesale-
+    # replaced -- only variables the new package defines that the live
+    # file doesn't already have get appended, idempotently (safe to
+    # re-run; a variable only gets added once, ever).
+    if [ -f /etc/sysconfig/alloy.rpmnew ]; then
+        grep -oE '^[A-Z_]+=' /etc/sysconfig/alloy.rpmnew | sed 's/=$//' | sort -u | while IFS= read -r key; do
+            if ! grep -q "^${key}=" /etc/sysconfig/alloy 2>/dev/null; then
+                value_line=$(grep "^${key}=" /etc/sysconfig/alloy.rpmnew | head -n1)
+                printf '\n# Added automatically on upgrade (%%s) from the new package template:\n%%s\n' \
+                    "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)" "$value_line" >> /etc/sysconfig/alloy
+            fi
+        done
+        rm -f /etc/sysconfig/alloy.rpmnew
+    fi
+
+    # An upgrade never retroactively fixes an existing file's permissions on
+    # its own -- confirmed live, re-assert every upgrade regardless of
+    # whether the block above actually added anything.
+    chmod 600 /etc/sysconfig/alloy
+
     if [ "$RESTART_ON_UPGRADE" = "true" ]; then
         systemctl daemon-reload
         systemctl restart alloy
